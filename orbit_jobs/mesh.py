@@ -1,0 +1,341 @@
+"""Optional NATS link between this app's processes and machines.
+
+A leaf: it imports nothing from ``core`` features, so the event bus, the job
+store and the workers can all use it. Off unless ``NATS_URLS`` is set; every
+function is then a cheap no-op and the app behaves exactly as without it.
+
+NATS here is an accelerator, never a source of truth. Messages are
+fire-and-forget hints (a live event, "work is waiting"); anything that must
+not be lost lives in a database, and every consumer keeps its polling path.
+So a dropped message, a NATS restart or a machine with no NATS at all only
+makes things slower, never wrong.
+
+Interface:
+
+* ``start()`` / ``stop()`` — once per process event loop (the server
+  lifespan, a worker's ``run_worker``, a remote worker's ``run``). ``start``
+  never blocks: it connects in the background and keeps retrying.
+* ``publish(subject, data)`` — sync, thread-safe, non-blocking. Drops the
+  message when not connected.
+* ``subscribe(subject, handler, key=...)`` — declarative: recorded now,
+  applied whenever a connection comes up. ``handler(data, origin)`` may be
+  sync or async. Messages this process published are skipped unless
+  ``include_own``.
+* ``unsubscribe(key)`` — drops a recorded subscription.
+* ``subject(*tokens)`` — builds ``<prefix>.<token>…`` with tokens made safe.
+
+Config: ``NATS_URLS`` (comma-separated, e.g. ``nats://100.64.0.1:4222``),
+``NATS_USER`` / ``NATS_PASSWORD`` (optional), ``NATS_SUBJECT_PREFIX``
+(default ``automations``; separate deployments or tests use their own).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import json
+import logging
+import os
+import socket
+import uuid
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
+
+log = logging.getLogger(__name__)
+
+__all__ = [
+    "enabled",
+    "origin",
+    "subject",
+    "publish",
+    "subscribe",
+    "unsubscribe",
+    "start",
+    "stop",
+    "connected",
+]
+
+Handler = Callable[[dict, str], Any]
+
+RECONNECT_SECONDS = 2.0
+OUTBOX_SIZE = 4096
+
+_ORIGIN = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:6]}"
+
+
+@dataclass
+class _Sub:
+    subject: str
+    handler: Handler
+    include_own: bool
+    live: Any = None  # the nats Subscription while connected
+
+
+@dataclass
+class _State:
+    loop: asyncio.AbstractEventLoop | None = None
+    nc: Any = None
+    outbox: asyncio.Queue | None = None
+    tasks: list[asyncio.Task] = field(default_factory=list)
+    oversize_warned: set[str] = field(default_factory=set)
+    pending: int = 0  # messages queued or in flight; stop() waits for them
+
+
+_subs: dict[str, _Sub] = {}
+_state = _State()
+
+
+def _urls() -> list[str]:
+    return [u.strip() for u in os.environ.get("NATS_URLS", "").split(",") if u.strip()]
+
+
+def enabled() -> bool:
+    return bool(_urls())
+
+
+def origin() -> str:
+    """This process's id, stamped on every message it publishes."""
+    return _ORIGIN
+
+
+def subject(*tokens: Any) -> str:
+    """``subject("work", "remote-cpu")`` → ``automations.work.remote-cpu``.
+
+    Dots, spaces and wildcards inside a token become ``_`` so a capability or
+    bus name can never change the subject's shape.
+    """
+    prefix = os.environ.get("NATS_SUBJECT_PREFIX", "automations")
+    safe = ["".join("_" if ch in ". *>\t\r\n" else ch for ch in str(t)) or "_" for t in tokens]
+    return ".".join([prefix, *safe])
+
+
+def connected() -> bool:
+    return _state.nc is not None and bool(getattr(_state.nc, "is_connected", False))
+
+
+# -- publish ---------------------------------------------------------------
+
+def publish(subject: str, data: dict) -> None:
+    """Queue ``data`` for ``subject``. Never blocks, never raises."""
+    loop, outbox = _state.loop, _state.outbox
+    if loop is None or outbox is None or loop.is_closed():
+        return
+    try:
+        payload = json.dumps({"origin": _ORIGIN, "data": data}, default=str).encode()
+    except (TypeError, ValueError):
+        log.debug("mesh: unserialisable message for %s dropped", subject, exc_info=True)
+        return
+    try:
+        loop.call_soon_threadsafe(_offer, outbox, (subject, payload))
+    except RuntimeError:  # loop closed between the check and the call
+        pass
+
+
+def _offer(outbox: asyncio.Queue, item: tuple[str, bytes]) -> None:
+    try:
+        outbox.put_nowait(item)
+        _state.pending += 1
+    except asyncio.QueueFull:
+        log.debug("mesh: outbox full, dropping a message for %s", item[0])
+
+
+async def _pump(outbox: asyncio.Queue) -> None:
+    while True:
+        item = await outbox.get()
+        try:
+            await _send(*item)
+        finally:
+            _state.pending -= 1
+
+
+async def _send(subj: str, payload: bytes) -> None:
+    nc = _state.nc
+    if nc is None or not nc.is_connected:
+        return  # fire-and-forget: the database is the record
+    limit = getattr(nc, "max_payload", 0) or 0
+    if limit and len(payload) > limit:
+        if subj not in _state.oversize_warned:
+            _state.oversize_warned.add(subj)
+            log.warning("mesh: %d-byte message for %s exceeds the server's %d-byte "
+                        "limit; dropping (warned once per subject)", len(payload), subj, limit)
+        return
+    try:
+        await nc.publish(subj, payload)
+    except Exception:  # noqa: BLE001 — a publish failure must never surface to callers
+        log.debug("mesh: publish to %s failed", subj, exc_info=True)
+
+
+# -- subscribe -------------------------------------------------------------
+
+def subscribe(subject: str, handler: Handler, *, key: str | None = None,
+              include_own: bool = False) -> None:
+    """Record a subscription; it goes live on every (re)connect.
+
+    ``key`` names the subscription so registering again replaces it (a bus
+    or worker re-created in tests doesn't stack handlers). Defaults to the
+    subject.
+    """
+    key = key or subject
+    old = _subs.get(key)
+    sub = _Sub(subject, handler, include_own)
+    _subs[key] = sub
+    _schedule(_resubscribe(old, sub))
+
+
+def unsubscribe(key: str) -> None:
+    """Forget the subscription recorded under ``key`` (no-op if unknown)."""
+    old = _subs.pop(key, None)
+    if old is not None:
+        _schedule(_resubscribe(old, None))
+
+
+def _schedule(coro) -> None:
+    loop = _state.loop
+    if loop is None or loop.is_closed() or not connected():
+        coro.close()
+        return
+
+    def create() -> None:
+        _state.tasks.append(loop.create_task(coro))
+
+    loop.call_soon_threadsafe(create)
+
+
+async def _resubscribe(old: _Sub | None, new: _Sub | None) -> None:
+    if old is not None and old.live is not None and old.live is not _ATTACHING:
+        try:
+            await old.live.unsubscribe()
+        except Exception:  # noqa: BLE001
+            pass
+        old.live = None
+    if new is not None:
+        await _attach(new)
+
+
+_ATTACHING = object()  # placeholder while a subscribe call is in flight
+
+
+async def _attach(sub: _Sub) -> None:
+    nc = _state.nc
+    if nc is None or sub.live is not None:
+        return  # not connected, or already attached / attaching (no double delivery)
+    sub.live = _ATTACHING
+
+    async def on_msg(msg) -> None:
+        try:
+            envelope = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        sender = envelope.get("origin", "")
+        if sender == _ORIGIN and not sub.include_own:
+            return
+        try:
+            out = sub.handler(envelope.get("data") or {}, sender)
+            if inspect.isawaitable(out):
+                await out
+        except Exception:  # noqa: BLE001
+            log.exception("mesh: handler for %s failed", sub.subject)
+
+    try:
+        sub.live = await nc.subscribe(sub.subject, cb=on_msg)
+    except Exception:  # noqa: BLE001
+        sub.live = None
+        log.warning("mesh: subscribe to %s failed", sub.subject, exc_info=True)
+
+
+# -- lifecycle -------------------------------------------------------------
+
+async def start() -> None:
+    """Begin connecting on the running loop (no-op when disabled)."""
+    if not enabled():
+        return
+    loop = asyncio.get_running_loop()
+    if _state.loop is loop and _state.tasks:
+        return
+    if _state.loop is not None and _state.loop is not loop:
+        _reset()  # a previous loop (an earlier asyncio.run) is gone
+    _state.loop = loop
+    _state.outbox = asyncio.Queue(maxsize=OUTBOX_SIZE)
+    # Transport tasks, not work (allowlisted in tests/test_async_through_jobs.py).
+    _state.tasks = [
+        loop.create_task(_pump(_state.outbox), name="mesh-pump"),
+        loop.create_task(_connect_forever(), name="mesh-connect"),
+    ]
+
+
+async def _connect_forever() -> None:
+    import nats  # imported here so a process without NATS_URLS never loads it
+
+    async def on_disconnect() -> None:
+        log.warning("mesh: disconnected from NATS; retrying")
+
+    async def on_reconnect() -> None:
+        log.info("mesh: reconnected to NATS")
+
+    async def on_error(exc: Exception) -> None:
+        log.debug("mesh: NATS error: %s", exc)
+
+    options: dict[str, Any] = {
+        "servers": _urls(),
+        "name": _ORIGIN,
+        "allow_reconnect": True,
+        "max_reconnect_attempts": -1,
+        "reconnect_time_wait": RECONNECT_SECONDS,
+        "connect_timeout": 5,
+        "disconnected_cb": on_disconnect,
+        "reconnected_cb": on_reconnect,
+        "error_cb": on_error,
+    }
+    if os.environ.get("NATS_USER"):
+        options["user"] = os.environ["NATS_USER"]
+        options["password"] = os.environ.get("NATS_PASSWORD", "")
+    warned = False
+    while True:
+        try:
+            nc = await nats.connect(**options)
+            break
+        except Exception as exc:  # noqa: BLE001 — keep the app running without NATS
+            if not warned:
+                log.warning("mesh: NATS unreachable at %s (%s); running without it and "
+                            "retrying every %.0fs", ",".join(_urls()), exc, RECONNECT_SECONDS)
+                warned = True
+            await asyncio.sleep(RECONNECT_SECONDS)
+    _state.nc = nc
+    log.info("mesh: connected to NATS at %s as %s", nc.connected_url.netloc, _ORIGIN)
+    # nats-py restores live subscriptions after a reconnect by itself.
+    for sub in list(_subs.values()):
+        await _attach(sub)
+
+
+async def stop() -> None:
+    """Send what's queued (up to ~1 s) and close the connection."""
+    tasks, nc = _state.tasks, _state.nc
+    if nc is not None:
+        await asyncio.sleep(0)  # let publishes scheduled just before stop() enqueue
+        for _ in range(100):
+            if _state.pending <= 0:
+                break
+            await asyncio.sleep(0.01)
+    for task in tasks:
+        task.cancel()
+    for task in tasks:
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+    if nc is not None:
+        try:
+            await nc.drain()
+        except Exception:  # noqa: BLE001
+            pass
+    _reset()
+
+
+def _reset() -> None:
+    for sub in _subs.values():
+        sub.live = None
+    _state.loop = _state.nc = _state.outbox = None
+    _state.tasks = []
+    _state.pending = 0
+    _state.oversize_warned.clear()
