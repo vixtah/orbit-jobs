@@ -22,6 +22,12 @@ Interface:
   sync or async. Messages this process published are skipped unless
   ``include_own``.
 * ``unsubscribe(key)`` — drops a recorded subscription.
+* ``serve(subject, handler, queue=..., workers=N)`` — answer requests: one member of the
+  queue group gets each request; ``handler(data) -> dict`` runs on a pool of ``workers``
+  threads (CPU-bound work never blocks the connection) and its dict is the reply.
+* ``request_sync(subject, data, timeout)`` — ask and wait, from any thread but the mesh's
+  own loop. None when not connected, nobody answers, or the wait times out: callers
+  always have a local way to do the work.
 * ``subject(*tokens)`` — builds ``<prefix>.<token>…`` with tokens made safe.
 
 Config: ``NATS_URLS`` (comma-separated, e.g. ``nats://100.64.0.1:4222``),
@@ -51,6 +57,8 @@ __all__ = [
     "publish",
     "subscribe",
     "unsubscribe",
+    "serve",
+    "request_sync",
     "start",
     "stop",
     "connected",
@@ -70,6 +78,8 @@ class _Sub:
     handler: Handler
     include_own: bool
     live: Any = None  # the nats Subscription while connected
+    queue: str = ""  # queue group: one member gets each message
+    pool: Any = None  # ThreadPoolExecutor for a responder (serve); None for plain handlers
 
 
 @dataclass
@@ -187,6 +197,8 @@ def unsubscribe(key: str) -> None:
     """Forget the subscription recorded under ``key`` (no-op if unknown)."""
     old = _subs.pop(key, None)
     if old is not None:
+        if old.pool is not None:
+            old.pool.shutdown(wait=False, cancel_futures=True)
         _schedule(_resubscribe(old, None))
 
 
@@ -228,6 +240,9 @@ async def _attach(sub: _Sub) -> None:
         except (ValueError, TypeError):
             return
         sender = envelope.get("origin", "")
+        if sub.pool is not None:
+            await _respond(sub, msg, envelope.get("data") or {})
+            return
         if sender == _ORIGIN and not sub.include_own:
             return
         try:
@@ -238,10 +253,65 @@ async def _attach(sub: _Sub) -> None:
             log.exception("mesh: handler for %s failed", sub.subject)
 
     try:
-        sub.live = await nc.subscribe(sub.subject, cb=on_msg)
+        sub.live = await nc.subscribe(sub.subject, queue=sub.queue, cb=on_msg)
     except Exception:  # noqa: BLE001
         sub.live = None
         log.warning("mesh: subscribe to %s failed", sub.subject, exc_info=True)
+
+
+async def _respond(sub: _Sub, msg, data: dict) -> None:
+    """Run a responder's handler off the loop and send its dict back."""
+    if not msg.reply:
+        return
+    loop = asyncio.get_running_loop()
+    try:
+        reply = await loop.run_in_executor(sub.pool, sub.handler, data)
+    except Exception as exc:  # noqa: BLE001 — the asker falls back to doing it itself
+        log.exception("mesh: responder for %s failed", sub.subject)
+        reply = {"error": f"{type(exc).__name__}: {exc}"}
+    try:
+        await msg.respond(json.dumps(reply, default=str).encode())
+    except Exception:  # noqa: BLE001
+        log.debug("mesh: reply on %s failed", sub.subject, exc_info=True)
+
+
+def serve(subject: str, handler: Callable[[dict], dict], *, queue: str,
+          key: str | None = None, workers: int = 1) -> None:
+    """Answer requests on ``subject`` as one member of ``queue`` (see the module doc)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    key = key or f"serve:{subject}"
+    old = _subs.get(key)
+    if old is not None and old.pool is not None:
+        old.pool.shutdown(wait=False, cancel_futures=True)
+    sub = _Sub(subject, handler, include_own=True, queue=queue,
+               pool=ThreadPoolExecutor(max_workers=max(1, workers),
+                                       thread_name_prefix=f"mesh-serve-{queue}"))
+    _subs[key] = sub
+    _schedule(_resubscribe(old, sub))
+
+
+def request_sync(subject: str, data: dict, timeout: float) -> dict | None:
+    """Ask once and wait up to ``timeout`` seconds for one answer (see the module doc)."""
+    loop, nc = _state.loop, _state.nc
+    if loop is None or nc is None or loop.is_closed() or not connected():
+        return None
+    try:
+        if asyncio.get_running_loop() is loop:
+            log.warning("mesh: request_sync called on the mesh loop; use a thread")
+            return None
+    except RuntimeError:
+        pass  # no loop in this thread: the expected case
+    payload = json.dumps({"origin": _ORIGIN, "data": data}, default=str).encode()
+    future = asyncio.run_coroutine_threadsafe(nc.request(subject, payload, timeout=timeout),
+                                              loop)
+    try:
+        msg = future.result(timeout + 1.0)
+        return json.loads(msg.data)
+    except Exception as exc:  # noqa: BLE001 — no responders, timeout, bad reply: do it locally
+        future.cancel()
+        log.debug("mesh: request on %s got no answer (%s)", subject, type(exc).__name__)
+        return None
 
 
 # -- lifecycle -------------------------------------------------------------
