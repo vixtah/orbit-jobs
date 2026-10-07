@@ -80,6 +80,7 @@ class _Sub:
     live: Any = None  # the nats Subscription while connected
     queue: str = ""  # queue group: one member gets each message
     pool: Any = None  # ThreadPoolExecutor for a responder (serve); None for plain handlers
+    inflight: set = field(default_factory=set)  # a responder's requests being answered
 
 
 @dataclass
@@ -241,7 +242,11 @@ async def _attach(sub: _Sub) -> None:
             return
         sender = envelope.get("origin", "")
         if sub.pool is not None:
-            await _respond(sub, msg, envelope.get("data") or {})
+            # The client runs a subscription's callbacks one at a time: answering here would
+            # serialise requests whatever the pool size. Answer on a task (stop() waits).
+            task = asyncio.ensure_future(_respond(sub, msg, envelope.get("data") or {}))
+            sub.inflight.add(task)
+            task.add_done_callback(sub.inflight.discard)
             return
         if sender == _ORIGIN and not sub.include_own:
             return
@@ -378,9 +383,24 @@ async def _connect_forever() -> None:
         await _attach(sub)
 
 
+RESPOND_GRACE = 60.0  # seconds stop() waits for requests being answered
+
+
 async def stop() -> None:
-    """Send what's queued (up to ~1 s) and close the connection."""
+    """Stop taking requests, answer the ones in flight (up to ``RESPOND_GRACE`` s), send
+    what's queued (up to ~1 s) and close the connection."""
     tasks, nc = _state.tasks, _state.nc
+    responders = [sub for sub in _subs.values() if sub.pool is not None]
+    for sub in responders:
+        if sub.live is not None and sub.live is not _ATTACHING:
+            try:  # stop delivery; requests already delivered still start (inflight)
+                await sub.live.drain()
+            except Exception:  # noqa: BLE001
+                pass
+            sub.live = None
+    inflight = [t for sub in responders for t in sub.inflight]
+    if inflight:
+        await asyncio.wait(inflight, timeout=RESPOND_GRACE)
     if nc is not None:
         await asyncio.sleep(0)  # let publishes scheduled just before stop() enqueue
         for _ in range(100):
