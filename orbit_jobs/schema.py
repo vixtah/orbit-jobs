@@ -1,10 +1,11 @@
 """DDL for the jobs + job_steps tables.
 
 The module owns its own schema. ``register_schema(conn)`` is called
-from :func:`core.db.get_db` on every connection. It ensures the current
+from the configured ``get_db`` on every connection (the host's
+:func:`core.db.get_db`; ``orbit_jobs.db.connect`` otherwise). It ensures the current
 fresh-install baseline exists; older local DBs are not upgraded in-place.
 
-Centralizing the DDL here means writers in ``core.jobs.store`` can
+Centralizing the DDL here means writers in ``orbit_jobs.store`` can
 reason about column shape without hunting through ``tasks_db.py`` and
 keeps any future migration story for jobs/job_steps in one file.
 """
@@ -200,7 +201,7 @@ def register_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_worker_heartbeats_alive"
         " ON worker_heartbeats (capability, last_alive_at)"
     )
-    # Orphaned: the object-storage input mirror (``core.jobs.remote``'s former
+    # Orphaned: the object-storage input mirror (``orbit_jobs.remote``'s former
     # ``mirror_inputs`` / the redirect branch of ``input_location``) was
     # removed; stays in the baseline schema per the no-drop convention
     # (same pattern as ``resource_samples`` in core/db.py).

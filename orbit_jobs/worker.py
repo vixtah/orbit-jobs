@@ -18,7 +18,8 @@ FastAPI in-process runner uses, so a kind can move between in-process
 and worker-routed by toggling ``required_capability`` at spawn time.
 No handler code change required.
 
-Run a worker through the app composition root:
+Run a worker through a composition root that registers the kinds and
+configures the hooks (``orbit_jobs.config``); in the automations host:
 
     uv run python -m app.worker --capability ollama
 
@@ -44,17 +45,16 @@ import time
 import uuid
 from pathlib import Path
 
-from core import mesh
-from core.jobs import events, wake
-from core.jobs.capture import clear_handle, start_handle
-from core.jobs.registry import get_descriptor, get_handler, list_kinds
-from core.jobs.retry import maybe_retry
-from core.jobs.runner import (
+from orbit_jobs import config, events, wake
+from orbit_jobs.capture import clear_handle, start_handle
+from orbit_jobs.registry import get_descriptor, get_handler, list_kinds
+from orbit_jobs.retry import maybe_retry
+from orbit_jobs.runner import (
     emit_activity_for_job_finish,
     register_handle,
     unregister_handle,
 )
-from core.jobs.store import (
+from orbit_jobs.store import (
     cancel_requested,
     claim_one,
     heartbeat,
@@ -63,7 +63,6 @@ from core.jobs.store import (
     worker_heartbeat,
     worker_unregister,
 )
-from core.sources.browsers import kill_child_process_tree
 
 log = logging.getLogger("jobs.worker")
 
@@ -90,11 +89,12 @@ def current_code_version() -> str:
     """Return a short hash representing the running code.
 
     Prefers the current git HEAD (cheap, monotonic with commits). Falls
-    back to a hash of mtime+size for every .py under ``core/`` and
-    ``app/`` so non-git installs and uncommitted edits still trigger
-    auto-restart.
+    back to a hash of mtime+size for every .py under the configured
+    ``code_dirs`` (the host: ``core/``, ``app/`` and this package) so
+    non-git installs and uncommitted edits still trigger auto-restart. The
+    checkout is ``config.settings.code_root`` (default: the working directory).
     """
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = _code_root()
     # Fast path: git HEAD. ``git rev-parse HEAD`` is microseconds.
     try:
         out = subprocess.check_output(
@@ -118,10 +118,14 @@ def current_code_version() -> str:
     return f"{_NO_GIT}+{_dirty_digest(repo_root)}"
 
 
+def _code_root() -> Path:
+    return Path(config.settings.code_root or Path.cwd())
+
+
 def _dirty_digest(repo_root: Path) -> str:
-    """Hash mtime+size of every .py file under core/ and app/."""
+    """Hash mtime+size of every .py file under the configured code dirs."""
     h = hashlib.md5(usedforsecurity=False)
-    for sub in ("core", "app"):
+    for sub in config.settings.code_dirs:
         base = repo_root / sub
         if not base.exists():
             continue
@@ -195,17 +199,21 @@ def _maybe_exec_for_new_code() -> None:
 
 
 def _import_health_ok() -> bool:
-    """Probe that ``app.kinds`` still imports cleanly in a fresh
-    interpreter. The checkout can be transiently broken — e.g. conflict
-    markers while the merge coordinator resolves a feature in the live
-    tree — and exec'ing into a SyntaxError kills the worker permanently
-    (``execv`` has no way back). Every exec/restart trigger must call
+    """Probe that ``config.settings.import_probe`` (the host: ``app.kinds``)
+    still imports cleanly in a fresh interpreter; no probe configured passes.
+    The checkout can be transiently broken — e.g. conflict markers while the
+    merge coordinator resolves a feature in the live tree — and exec'ing
+    into a SyntaxError kills the worker permanently (``execv`` has no way
+    back). Every exec/restart trigger must call
     this immediately before exec'ing, not earlier: checking well before
     the exec leaves a TOCTOU window where the tree changes in between.
     """
+    module = config.settings.import_probe
+    if not module:
+        return True
     try:
         probe = subprocess.run(
-            [sys.executable, "-c", "import app.kinds"],
+            [sys.executable, "-c", f"import {module}"],
             capture_output=True, text=True, timeout=60,
         )
     except Exception:
@@ -255,8 +263,9 @@ def _exec_self(reason: str = "restart requested") -> None:
         return
     # execv wipes threads but not child processes — a cancelled/timed-out
     # sync scrape (e.g. Playwright) can leave its node/chromium orphaned,
-    # holding the browser profile's SingletonLock. Reap them first.
-    kill_child_process_tree()
+    # holding the browser profile's SingletonLock. Reap them first (the
+    # ``reap_children`` hook).
+    config.settings.reap_children()
     # Flush any pending log output before the exec wipes state.
     for handler in logging.getLogger().handlers:
         try:
@@ -264,7 +273,7 @@ def _exec_self(reason: str = "restart requested") -> None:
         except Exception:  # noqa: BLE001
             pass
     args = sys.argv[1:]  # everything after the script path — flags like --capability
-    module = os.environ.get("AUTOMATIONS_WORKER_MODULE", "core.jobs.worker")
+    module = os.environ.get("AUTOMATIONS_WORKER_MODULE", config.settings.worker_module)
     os.execv(sys.executable, [sys.executable, "-m", module, *args])
 
 
@@ -507,8 +516,8 @@ async def run_worker(
         "worker %s started, capabilities=%s, registered_kinds=%s",
         worker_id, capabilities, list_kinds(),
     )
-    # Guard: the engine (core.jobs.worker) registers no kinds on its own —
-    # the app composition root (app.worker) must import app.kinds first. If
+    # Guard: the engine (orbit_jobs.worker) registers no kinds on its own —
+    # the composition root (the host's app.worker) must register them first. If
     # the registry is empty, every claimed job fails with "no handler for
     # kind", which reads as a stuck pipeline rather than a launch mistake.
     # Surface it once, loudly, instead of spraying per-job errors. (This is
@@ -516,9 +525,9 @@ async def run_worker(
     if not list_kinds():
         log.error(
             "worker %s started with ZERO registered job kinds — it will fail "
-            "every job with 'no handler for kind'. Launch via 'python -m "
-            "app.worker' (which imports app.kinds), not 'python -m "
-            "core.jobs.worker'. AUTOMATIONS_WORKER_MODULE=%r",
+            "every job with 'no handler for kind'. Launch through a composition "
+            "root that registers the kinds (the host: 'python -m app.worker'), "
+            "not the bare engine module. AUTOMATIONS_WORKER_MODULE=%r",
             worker_id, os.environ.get("AUTOMATIONS_WORKER_MODULE"),
         )
 
@@ -540,6 +549,7 @@ async def run_worker(
 
     # Instant wake-ups over NATS when NATS_URLS is set; polling otherwise.
     wake_event = asyncio.Event()
+    mesh = config.settings.transport
     await mesh.start()
     wake.listen(capabilities, wake_event, key=f"worker:{worker_id}")
     try:
@@ -622,26 +632,18 @@ async def _claim_loop(capabilities, worker_id, stop_event, wake_event, poll_inte
         if EXEC_ON_CODE_DRIFT:
             _maybe_exec_for_new_code()
 
-        # Yield ollama to the voice pipeline. While a voice session is
-        # active, ollama-capable workers stop claiming new jobs so the
-        # model isn't contending with voice generation. In-flight jobs
-        # are unaffected; only the *next* claim is paused. Non-ollama
-        # workers (db, applescript, etc.) keep draining their queues
-        # since they don't touch the model.
-        ollama_paused = False
-        if "ollama" in capabilities:
-            try:
-                from core.voice import busy as _voice_busy
-                if _voice_busy.is_busy():
-                    ollama_paused = True
-            except Exception:
-                # core.voice not available in this worker venv — fine.
-                pass
+        # The ``pause_claiming`` hook can hold the *next* claim (the host
+        # yields ollama to an active voice session); in-flight jobs are
+        # unaffected. A failing hook never pauses.
+        try:
+            paused = bool(config.settings.pause_claiming(capabilities))
+        except Exception:  # noqa: BLE001
+            paused = False
 
         # Clear before claiming: a hint that lands after this point (even
         # during the claim) wakes the idle wait below, so none is lost.
         wake_event.clear()
-        if ollama_paused:
+        if paused:
             job = None
         else:
             try:
@@ -713,9 +715,8 @@ def main(argv: list[str] | None = None) -> int:
         print("--capability cannot be empty", file=sys.stderr)
         return 2
 
-    # Mirror this worker's logging into tasks.db (see core.logsink).
-    from core import logsink
-    logsink.install(f"worker-{'+'.join(capabilities)}")
+    # e.g. the host mirrors this worker's logging into tasks.db (core.logsink).
+    config.settings.on_worker_start(capabilities)
 
     global EXEC_AFTER_DIRTY_JOB, EXEC_ON_CODE_DRIFT
     EXEC_AFTER_DIRTY_JOB = True
@@ -745,7 +746,7 @@ def main(argv: list[str] | None = None) -> int:
         loop.close()
         # SIGTERM shutdown reaps children too — a job in flight when the
         # signal landed can leave a Playwright node/chromium behind.
-        kill_child_process_tree()
+        config.settings.reap_children()
     log.info("uptime: %.1fs", time.time() - started)
     return 0
 

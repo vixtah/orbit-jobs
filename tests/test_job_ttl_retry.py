@@ -16,12 +16,12 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 
-from core import jobs
-from core.db import get_db
-from core.jobs import store as _store
-from core.jobs.registry import KindDescriptor
-from core.jobs.store import insert, request_cancel
-from core.jobs.worker import run_worker
+import orbit_jobs as jobs
+from orbit_jobs import store as _store
+from orbit_jobs.db import get_db
+from orbit_jobs.registry import KindDescriptor
+from orbit_jobs.store import insert, request_cancel
+from orbit_jobs.worker import run_worker
 
 
 def _age_job(job_id: int, *, seconds: float) -> None:
@@ -191,7 +191,7 @@ def test_failed_job_retries_once_then_stops():
 def test_cancelled_job_never_retries(monkeypatch):
     """A user-cancelled job spawns no retry row even when its kind opts
     into retries."""
-    monkeypatch.setattr("core.jobs.worker.HEARTBEAT_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setattr("orbit_jobs.worker.HEARTBEAT_INTERVAL_SECONDS", 0.05)
 
     started = asyncio.Event()
 

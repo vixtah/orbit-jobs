@@ -1,7 +1,8 @@
 """Per-job event stream for live observation (SSE).
 
-Transport is the shared ``core.events.bus`` (one topic per job_id). This
-module owns only the job-specific shape on top of it:
+Transport is the configured bus (``config.settings.make_bus``; one topic per
+job_id), built on first use. This module owns only the job-specific shape on top
+of it:
 
 - ``step.started``  — a node just entered (id, name, started_at, input_text)
 - ``step.finished`` — terminal status, ms, output_text, error?
@@ -16,23 +17,38 @@ job's kind/subject) so the dashboard can invalidate only the affected
 React Query keys without a global refetch.
 
 Queue size: ``JOBS_EVENT_QUEUE_SIZE`` (default 256). A slow subscriber
-loses events and recovers via ``GET /api/jobs/{id}`` — see ``core.events.bus``.
+loses events and recovers from the job row (``store.get``).
 """
 
 from __future__ import annotations
 
 import os
+import threading
 from typing import AsyncIterator
 
-from core.events.bus import Bus
+from orbit_jobs import config
+from orbit_jobs.db import get_db
 
-_bus = Bus("jobs", queue_size=int(os.environ.get("JOBS_EVENT_QUEUE_SIZE", "256")))
+_QUEUE_SIZE = int(os.environ.get("JOBS_EVENT_QUEUE_SIZE", "256"))
+_bus = None
+_bus_factory = None
+_bus_lock = threading.Lock()
+
+
+def _the_bus():
+    """The ``jobs`` bus, rebuilt if a different ``make_bus`` hook is configured."""
+    global _bus, _bus_factory
+    factory = config.settings.make_bus
+    with _bus_lock:
+        if _bus is None or _bus_factory is not factory:
+            _bus, _bus_factory = factory("jobs", queue_size=_QUEUE_SIZE), factory
+        return _bus
 
 
 def emit(job_id: int, event: dict) -> None:
     """Publish an event for a job to its per-job subscribers (and the
     firehose feeding ``subscribe_global``). Non-blocking."""
-    _bus.emit(event, topic=job_id)
+    _the_bus().emit(event, topic=job_id)
 
 
 async def subscribe(
@@ -45,7 +61,7 @@ async def subscribe(
     snapshot, if given, is yielded first so clients don't race the gap
     between "fetch current state" and "subscribe to deltas".
     """
-    async for event in _bus.subscribe(job_id, initial=initial):
+    async for event in _the_bus().subscribe(job_id, initial=initial):
         yield event
         if event.get("type") == "job.finished":
             break
@@ -59,7 +75,7 @@ async def subscribe_global() -> AsyncIterator[dict]:
     keys to invalidate, so only affected components refetch. A ``ping``
     every 30s lets clients detect dead streams.
     """
-    async for topic, event in _bus.firehose(
+    async for topic, event in _the_bus().firehose(
         idle_timeout=30.0, idle_event=(None, {"type": "ping"}),
     ):
         if event.get("type") == "ping":
@@ -77,7 +93,7 @@ async def subscribe_global() -> AsyncIterator[dict]:
 
 
 def has_subscribers(job_id: int) -> bool:
-    return _bus.has_subscribers(job_id)
+    return _the_bus().has_subscribers(job_id)
 
 
 # Cached (kind, subject_type, subject_id) per job_id so the global stream
@@ -91,7 +107,6 @@ def _job_meta(job_id: int) -> dict:
     if cached is not None:
         return cached
     try:
-        from core.db import get_db  # local: avoid import-time cycle
         with get_db() as conn:
             row = conn.execute(
                 "SELECT kind, subject_type, subject_id FROM jobs WHERE id = ?",

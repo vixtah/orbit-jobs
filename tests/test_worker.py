@@ -7,12 +7,11 @@ import json
 import threading
 from datetime import datetime, timedelta, timezone
 
+import orbit_jobs as jobs
+import orbit_jobs.worker as worker_module
 import pytest
-
-import core.jobs.worker as worker_module
-from core import jobs
-from core.db import get_db
-from core.jobs.store import (
+from orbit_jobs.db import get_db
+from orbit_jobs.store import (
     cancel_requested,
     claim_one,
     delete_job,
@@ -22,7 +21,7 @@ from core.jobs.store import (
     recover_orphans,
     request_cancel,
 )
-from core.jobs.worker import run_worker
+from orbit_jobs.worker import run_worker
 
 
 @pytest.fixture(autouse=True)
@@ -213,7 +212,7 @@ def test_run_worker_drains_and_dispatches():
         received.append((job_id, payload))
         return {"ok": True, "got": payload}
 
-    from core.jobs.registry import KindDescriptor
+    from orbit_jobs.registry import KindDescriptor
     jobs.register_kind(KindDescriptor(
         kind="test_worker_kind", label="t", description="t", handler=handler,
     ))
@@ -317,7 +316,7 @@ def test_run_worker_cancels_handler_on_cross_process_request(monkeypatch):
     the in-flight handler task; the job lands cancelled and the worker
     itself stays alive to drain the next job."""
     monkeypatch.setattr(
-        "core.jobs.worker.HEARTBEAT_INTERVAL_SECONDS", 0.05,
+        "orbit_jobs.worker.HEARTBEAT_INTERVAL_SECONDS", 0.05,
     )
 
     started = asyncio.Event()
@@ -332,7 +331,7 @@ def test_run_worker_cancels_handler_on_cross_process_request(monkeypatch):
         second_ran.append(job_id)
         return {"ok": True}
 
-    from core.jobs.registry import KindDescriptor
+    from orbit_jobs.registry import KindDescriptor
     jobs.register_kind(KindDescriptor(
         kind="test_worker_slow", label="t", description="t",
         handler=slow_handler,
@@ -393,7 +392,7 @@ def test_run_worker_cancels_handler_on_cross_process_request(monkeypatch):
 def test_exec_self_execs_when_import_health_check_passes(monkeypatch):
     execd: list[list[str]] = []
     monkeypatch.setattr(worker_module, "_import_health_ok", lambda: True)
-    monkeypatch.setattr(worker_module, "kill_child_process_tree", lambda: None)
+    monkeypatch.setattr(worker_module.config.settings, "reap_children", lambda: None)
     monkeypatch.setattr(worker_module.os, "execv", lambda *a: execd.append(list(a)))
 
     worker_module._exec_self(reason="test")
@@ -493,7 +492,7 @@ def test_dirty_job_exec_path_blocked_by_import_health_check(monkeypatch):
     async def hanging_handler(job_id: int, payload: dict):
         await asyncio.sleep(60)
 
-    from core.jobs.registry import KindDescriptor
+    from orbit_jobs.registry import KindDescriptor
     jobs.register_kind(KindDescriptor(
         kind="test_worker_dirty_gate", label="t", description="t",
         handler=hanging_handler,
@@ -534,7 +533,7 @@ def test_run_worker_marks_failed_on_handler_exception():
     async def handler(job_id: int, payload: dict):
         raise RuntimeError("boom")
 
-    from core.jobs.registry import KindDescriptor
+    from orbit_jobs.registry import KindDescriptor
     jobs.register_kind(KindDescriptor(
         kind="test_worker_failing", label="t", description="t", handler=handler,
     ))
@@ -639,7 +638,7 @@ def test_heartbeat_and_cancel_requested_run_off_event_loop_thread(monkeypatch):
         await asyncio.sleep(0.3)
         return {"ok": True}
 
-    from core.jobs.registry import KindDescriptor
+    from orbit_jobs.registry import KindDescriptor
     jobs.register_kind(KindDescriptor(
         kind="test_worker_hb_thread", label="t", description="t", handler=handler,
     ))

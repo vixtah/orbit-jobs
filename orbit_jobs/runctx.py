@@ -1,17 +1,18 @@
 """Active run context — the ambient telemetry + cancellation handle.
 
-A dependency-free leaf. Domain modules (``llm``, ``tasks``, ``calendar``,
-the chat scrapers) record I/O / LLM calls and check for cancellation
-against the currently-running job via :func:`current`, WITHOUT importing
-``core.jobs`` — which would create a ``domain -> jobs`` import cycle, since
-``jobs`` already depends on the domains its kinds orchestrate.
+A dependency-free leaf (the host imports it as ``core.runctx``, the same
+module object). Domain modules (``llm``, ``tasks``, ``calendar``, the chat
+scrapers) record I/O / LLM calls and check for cancellation against the
+currently-running job via :func:`current`, WITHOUT importing the job system
+— which would create a ``domain -> jobs`` import cycle, since ``jobs``
+already depends on the domains its kinds orchestrate.
 
 The jobs runtime publishes its ``JobHandle`` here via :func:`set_current`
 when a job starts; :func:`current` returns it, typed as the minimal
 :class:`RunContext` protocol. Outside a job (CLI, tests, the voice
 pipeline) ``current()`` is ``None`` and callers no-op.
 
-Implementation note: ``core.jobs.capture.JobHandle`` is the only concrete
+Implementation note: ``orbit_jobs.capture.JobHandle`` is the only concrete
 ``RunContext``; it satisfies this protocol structurally.
 """
 

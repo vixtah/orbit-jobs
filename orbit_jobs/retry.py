@@ -3,13 +3,13 @@
 A kind opts in via ``KindDescriptor.max_retries``; the worker calls
 ``maybe_retry`` from its failed (never cancelled) finish path to re-enqueue
 a fresh pending row. Lives beside ``worker``/``store`` in the engine layer —
-imports nothing above ``core.jobs``.
+imports nothing above ``orbit_jobs``.
 """
 
 from __future__ import annotations
 
-from core.jobs.registry import get_descriptor
-from core.jobs.store import insert
+from orbit_jobs.registry import get_descriptor
+from orbit_jobs.store import insert
 
 __all__ = ["maybe_retry"]
 

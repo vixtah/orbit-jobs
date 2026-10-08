@@ -1,6 +1,6 @@
 """Per-job and per-step capture context.
 
-Public API (re-exported from ``core.jobs``):
+Public API (re-exported from ``orbit_jobs``):
 
 - :class:`JobHandle` — methods callers use during a job:
   ``is_cancelled``, ``record_io``, ``record_llm``, ``annotate``,
@@ -45,9 +45,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Callable
 
-from core import runctx
-from core.jobs import events, store
-from core.runctx import current  # noqa: F401 — re-exported as the public accessor
+from orbit_jobs import events, runctx, store
+from orbit_jobs.runctx import current  # noqa: F401 — re-exported as the public accessor
 
 log = logging.getLogger(__name__)
 
@@ -109,7 +108,7 @@ class JobHandle:
            httpx clients held by ``core/llm.ainvoke``. Closing the
            client mid-stream surfaces a connection error at the await
            point.
-        3. ``Task.cancel()`` — happens in :func:`core.jobs.runner.cancel`
+        3. ``Task.cancel()`` — happens in :func:`orbit_jobs.runner.cancel`
            on the asyncio Task. This is what makes awaiting LLM calls
            raise ``CancelledError`` immediately rather than running to
            completion.
@@ -270,10 +269,10 @@ class JobHandle:
 
 # ── module-level ContextVars ──────────────────────────────────
 # The active-handle ContextVar lives in the dependency-free leaf
-# ``core.runctx`` so domain modules (llm, tasks, calendar, scrapers) can
-# read ``current()`` without importing ``core.jobs`` (which would cycle).
-# ``current`` is re-exported here so jobs-internal callers and the
-# ``core.jobs`` facade keep their existing import.
+# ``orbit_jobs.runctx`` (``core.runctx`` in the host) so domain modules
+# (llm, tasks, calendar, scrapers) can read ``current()`` without importing
+# the job system (which would cycle). ``current`` is re-exported here so
+# jobs-internal callers and the public facade keep their existing import.
 _current_step: ContextVar[StepBucket | None] = ContextVar(
     "_current_step_bucket", default=None,
 )

@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 
-import core.jobs.worker as worker_module
-from core import jobs
-from core.jobs.registry import KindDescriptor
-from core.jobs.store import insert
-from core.jobs.worker import run_worker
+import orbit_jobs as jobs
+import orbit_jobs.worker as worker_module
+from orbit_jobs.registry import KindDescriptor
+from orbit_jobs.store import insert
+from orbit_jobs.worker import run_worker
 
 
 def test_worker_heartbeat_refreshes_during_a_long_job(monkeypatch):

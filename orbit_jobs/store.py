@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import json
-import socket
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from core.compute_allocation import host_name
-from core.db import get_db, now_iso
-from core.jobs import wake
+from orbit_jobs import wake
+from orbit_jobs.db import get_db, now_iso
 
 ACTIVE_STATUSES = ("pending", "running")
 TERMINAL_STATUSES = ("succeeded", "failed", "cancelled")
@@ -29,7 +27,6 @@ __all__ = [
     "worker_heartbeat",
     "worker_unregister",
     "list_live_workers",
-    "compute_hosts",
     "pending_count_by_capability",
     "request_cancel",
     "cancel_requested",
@@ -96,7 +93,7 @@ def insert(
     ``origin`` records provenance (manual / scheduled / ingest /
     agent). Defaults to ``"agent"`` so a missed declaration shows
     up clearly in the dashboard rather than blending in with real
-    user clicks. Resolution lives in ``core.jobs.runner.spawn``.
+    user clicks. Resolution lives in ``orbit_jobs.runner.spawn``.
     """
     ts = now_iso()
     with get_db() as conn:
@@ -236,7 +233,7 @@ _STUCK_ABSOLUTE_SECONDS = 6 * 60 * 60
 # A remote job whose worker vanished (a spot machine reclaimed, a node cut off from the
 # hub) is infrastructure loss, not a failure: it is queued again, without spending its
 # failure retries, up to this many times in a row (a job that keeps killing its worker
-# stops). Remote capabilities are ``core.jobs.remote.REMOTE_CAPABILITY_PREFIX``.
+# stops). Remote capabilities are ``orbit_jobs.remote.REMOTE_CAPABILITY_PREFIX``.
 _ORPHAN_REQUEUES = 3
 _REMOTE_PREFIX = "remote-"
 # A remote worker heartbeats every 10 s, but over the network: the hub restarting or a
@@ -964,23 +961,3 @@ def cancel_orphans() -> int:
             (ts, reason, reason),
         )
         return cur.rowcount or 0
-
-
-def compute_hosts() -> dict[str, int]:
-    """Known machines and current self-play shards, using worker-id host prefixes."""
-    hosts = {host_name(socket.gethostname()): 0, "VictorHyte": 0}
-    with get_db() as conn:
-        rows = conn.execute("""SELECT worker_id, 0 AS running FROM worker_heartbeats
-            WHERE capability LIKE 'remote-%'
-            UNION ALL SELECT worker_id, CASE WHEN status='running' THEN 1 ELSE 0 END
-            FROM jobs WHERE kind='selfplay_shard' AND worker_id IS NOT NULL""")
-        for row in rows:
-            if row["worker_id"].count(":") < 3:
-                continue  # local worker IDs start with capability, not hostname
-            try:
-                host = host_name(row["worker_id"].split(":")[0])
-            except ValueError:
-                continue
-            key = next((h for h in hosts if h.lower() == host.lower()), host)
-            hosts[key] = hosts.get(key, 0) + row["running"]
-    return hosts

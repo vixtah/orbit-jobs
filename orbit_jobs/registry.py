@@ -20,7 +20,7 @@ state:
 
 This is the choke point that makes "how does this kind look in the UI"
 a registration-time question, not a per-spawn-call question. See
-CLAUDE.md → "Async work goes through core.jobs" for the full policy.
+the host's CLAUDE.md → "Async work goes through core.jobs" for the full policy.
 """
 
 from __future__ import annotations
@@ -93,7 +93,7 @@ def register_kind(descriptor: KindDescriptor) -> None:
     if not isinstance(descriptor, KindDescriptor):
         raise TypeError(
             "register_kind requires a KindDescriptor; the (kind, handler) "
-            "form is no longer supported. See core/jobs/registry.py."
+            "form is no longer supported. See orbit_jobs/registry.py."
         )
     _REGISTRY[descriptor.kind] = descriptor
 

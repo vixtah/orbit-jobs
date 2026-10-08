@@ -1,20 +1,18 @@
-"""Remote workers claim, run and finish jobs over HTTP (core.jobs.remote*)."""
+"""Remote workers claim, run and finish jobs over HTTP (orbit_jobs.remote*)."""
 
 from __future__ import annotations
 
 import asyncio
 
 import httpx
+import orbit_jobs as jobs
+import orbit_jobs.remote as remote
+import orbit_jobs.remote_worker as remote_worker
 import pytest
 from fastapi import FastAPI
-
-import core.jobs.remote as remote
-import core.jobs.remote_worker as remote_worker
-import server.worker_routes as wr
-from core import jobs
-from core.jobs.registry import KindDescriptor
-from core.jobs.store import get, insert, mark_terminal, request_cancel
-from server.remote_worker_routes import router
+from orbit_jobs.registry import KindDescriptor
+from orbit_jobs.routes import remote_worker_router
+from orbit_jobs.store import get, insert, mark_terminal, request_cancel
 
 TOKEN = "s3cret"
 HEAD = "a" * 40
@@ -29,7 +27,7 @@ def enabled(monkeypatch):
 
 def _client(token: str | None = TOKEN) -> httpx.AsyncClient:
     app = FastAPI()
-    app.include_router(router)
+    app.include_router(remote_worker_router())
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
                              base_url="http://server", headers=headers)
@@ -171,7 +169,7 @@ def test_lost_lease_stops_the_handler_and_keeps_the_sweeps_verdict():
 
 def _orphan(job_id: int) -> None:
     """Make ``job_id`` a running job whose worker stopped heartbeating long ago."""
-    from core.db import get_db
+    from orbit_jobs.db import get_db
 
     with get_db() as conn:
         conn.execute("UPDATE jobs SET status = 'running', started_at = ?, last_heartbeat_at = ? "
@@ -183,7 +181,7 @@ def _active(kind: str) -> list[dict]:
 
 
 def test_a_remote_job_whose_worker_vanished_is_queued_again_up_to_three_times():
-    from core.jobs.store import recover_orphans
+    from orbit_jobs.store import recover_orphans
 
     job_id = insert("test_remote_orphan", {"shard": 7}, subject_type="t", subject_id="run/7",
                     required_capability="remote-test", retry_count=1)
@@ -202,7 +200,7 @@ def test_a_remote_job_whose_worker_vanished_is_queued_again_up_to_three_times():
 
 
 def test_a_remote_job_cancelled_before_its_worker_vanished_is_not_queued_again():
-    from core.jobs.store import recover_orphans
+    from orbit_jobs.store import recover_orphans
 
     job_id = insert("test_remote_orphan", {}, subject_type="t", subject_id="run/8",
                     required_capability="remote-test")
@@ -213,7 +211,7 @@ def test_a_remote_job_cancelled_before_its_worker_vanished_is_not_queued_again()
 
 
 def test_a_local_job_whose_worker_vanished_is_only_cancelled():
-    from core.jobs.store import recover_orphans
+    from orbit_jobs.store import recover_orphans
 
     job_id = insert("test_local_orphan", {}, required_capability="ollama")
     _orphan(job_id)
@@ -225,7 +223,7 @@ def _silent_for(job_id: int, seconds: int) -> None:
     """Make ``job_id`` a running job whose last heartbeat was ``seconds`` ago."""
     from datetime import UTC, datetime, timedelta
 
-    from core.db import get_db
+    from orbit_jobs.db import get_db
 
     then = (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat()
     with get_db() as conn:
@@ -236,7 +234,7 @@ def _silent_for(job_id: int, seconds: int) -> None:
 def test_a_remote_job_survives_a_few_silent_minutes_but_a_local_one_does_not():
     """A hub restart can silence remote heartbeats for a minute (2026-10-06): remote jobs
     get 10 minutes before they count as dead, local ones keep 60 s."""
-    from core.jobs.store import recover_orphans
+    from orbit_jobs.store import recover_orphans
 
     remote = insert("test_remote_orphan", {}, subject_type="t", subject_id="run/9",
                     required_capability="remote-test")
@@ -313,16 +311,6 @@ def test_a_success_between_failures_keeps_the_worker_claiming():
     _drive_until(lambda: all(get(i)["status"] in ("failed", "succeeded") for i in ids), settle=0)
 
     assert [get(i)["status"] for i in ids] == ["failed", "failed", "succeeded", "failed", "failed"]
-
-
-def test_local_sweep_never_spawns_a_remote_capability(monkeypatch):
-    spawned = []
-    monkeypatch.setattr(wr, "_spawn", lambda cap: spawned.append(cap))
-    insert("test_remote_double", {}, required_capability="remote-test")
-
-    wr.sweep_dead_workers()
-
-    assert spawned == []
 
 
 def test_artifacts_upload_to_the_server_and_leave_the_worker(tmp_path, monkeypatch):
@@ -444,39 +432,6 @@ def test_a_worker_with_protocols_keeps_running_across_server_commits(monkeypatch
     job_id = insert("proto_e2e", {}, required_capability="remote-test")
     asyncio.run(_run_until(lambda: get(job_id)["status"] == "succeeded"))
     assert get(job_id)["result"] == {"ran": True}
-
-
-def test_a_training_job_holds_its_machines_shared_cpus_while_it_runs():
-    """A remote-gpu job claimed by a machine takes that machine's self-play/training pool
-    (its self-play drains) until it finishes."""
-    from core import compute_allocation as ca
-
-    ca.report("VictorHyte", 28, 16, 16)
-    ca.set_allocation("VictorHyte", 16, 0)
-    _register("remote-train-test", lambda *_: None, capability="remote-gpu")
-    job_id = insert("remote-train-test", {}, required_capability="remote-gpu")
-
-    async def go():
-        async with _client() as c:
-            claimed = await c.post("/api/remote-workers/claim", json={
-                "worker_id": "VictorHyte:remote-gpu:7:ab", "capabilities": ["remote-gpu"],
-                "pid": 7, "code_version": HEAD})
-            assert claimed.json()["job"]["id"] == job_id
-            held = ca.get_allocation("VictorHyte")
-            await c.post(f"/api/remote-workers/jobs/{job_id}/heartbeat",
-                         json={"worker_id": "VictorHyte:remote-gpu:7:ab", "pid": 7})
-            renewed = ca.get_allocation("VictorHyte")
-            await c.post(f"/api/remote-workers/jobs/{job_id}/finish", json={
-                "worker_id": "VictorHyte:remote-gpu:7:ab", "status": "succeeded"})
-            return held, renewed
-
-    held, renewed = asyncio.run(go())
-    assert (held["selfplay_now"], held["training_now"]) == (0, 16)
-    assert held["training_claimed_by"] == f"job {job_id}"
-    assert renewed["training_claimed_until"] >= held["training_claimed_until"]
-    after = ca.get_allocation("VictorHyte")
-    assert (after["selfplay_now"], after["training_now"], after["training_active"]) == (
-        16, 0, False)
 
 
 def test_a_running_job_publishes_its_progress_file_before_it_finishes(tmp_path, monkeypatch):

@@ -1,13 +1,15 @@
 """Job worker for another machine: claims ``remote-*`` jobs over HTTP.
 
 Runs on a box that has a checkout of this repo at the server's git HEAD
-but no access to ``tasks.db``. It polls the server's
+but no access to the server's database. It polls the server's
 ``/api/remote-workers`` routes, runs the registered handler locally, keeps
 the job's lease alive with heartbeats (which also carry cancel requests)
-and posts the result back. See ``core.jobs.remote`` for the server side
-and the pure-compute contract remote kinds must follow.
+and posts the result back. See ``orbit_jobs.remote`` for the server side
+and the pure-compute contract remote kinds must follow. The machine's name
+and the CPUs it must not use come from the ``host_name`` / ``excluded_cpus``
+hooks (``orbit_jobs.config``).
 
-Run it through the app composition root, which registers the kinds:
+Run it through a composition root that registers the kinds (the host's):
 
     REMOTE_WORKER_TOKEN=... uv run python -m app.remote_worker \\
         --server http://victors-macbook-pro-2:8765 --capability remote-cpu
@@ -32,11 +34,9 @@ from pathlib import Path, PurePosixPath
 
 import httpx
 
-from core import mesh
-from core.compute_allocation import allowed_cpus, default_excluded, host_name
-from core.jobs import wake
-from core.jobs.registry import get_handler, list_descriptors
-from core.jobs.remote import git_head, is_remote_capability
+from orbit_jobs import config, wake
+from orbit_jobs.registry import get_handler, list_descriptors
+from orbit_jobs.remote import git_head, is_remote_capability
 
 log = logging.getLogger("jobs.remote_worker")
 
@@ -352,7 +352,7 @@ async def run_remote_worker(
     if code_version is None:
         raise RuntimeError("remote worker needs a git checkout or AUTOMATIONS_CODE_VERSION "
                            "(the code version is checked on claim)")
-    worker_id = (f"{host_name(socket.gethostname())}:{','.join(capabilities)}:"
+    worker_id = (f"{config.settings.host_name(socket.gethostname())}:{','.join(capabilities)}:"
                  f"{os.getpid()}:{uuid.uuid4().hex[:6]}")
     log.info("remote worker %s at %s", worker_id, code_version[:12])
     # Protocol version of every kind this process can run: the server hands it
@@ -367,6 +367,7 @@ async def run_remote_worker(
     # With NATS_URLS set, a spawned job wakes this worker at once instead of
     # waiting out the idle backoff (up to MAX_IDLE_SLEEP_SECONDS).
     wake_event = asyncio.Event()
+    mesh = config.settings.transport
     await mesh.start()
     wake.listen(capabilities, wake_event, key=f"remote:{worker_id}")
     try:
@@ -450,6 +451,11 @@ def allocation_target(current: int, allocation: dict | None) -> int:
         return current
     # If hardware capacity shrinks, leave the training reservation intact.
     return min(target, max(0, usable - training))
+
+
+def allowed_cpus(logical_cpus: int, excluded_cpus: list[int]) -> list[int]:
+    excluded = set(excluded_cpus)
+    return [cpu for cpu in range(logical_cpus) if cpu not in excluded]
 
 
 def _cpus_of(mask: int) -> list[int]:
@@ -637,9 +643,9 @@ def _supervise(cmd: list[str], n: int, *, server: str, token: str,
 
     signal.signal(signal.SIGINT, on_stop)
     signal.signal(signal.SIGTERM, on_stop)
-    host = host_name(socket.gethostname())
+    host = config.settings.host_name(socket.gethostname())
     logical = os.cpu_count() or 1
-    excluded = default_excluded(host)
+    excluded = config.settings.excluded_cpus(host)
     target = min(n, len(allowed_cpus(logical, excluded)))
     if sys.platform == "darwin":
         log.info("macOS has no CPU affinity API; exclusions only reduce the worker budget")
@@ -680,7 +686,7 @@ def _supervise(cmd: list[str], n: int, *, server: str, token: str,
                     if follow_allocation:
                         target = allocation_target(target, allocation)
                     excluded = sorted(
-                        set(allocation["excluded_cpus"]) | set(default_excluded(host)))
+                        set(allocation["excluded_cpus"]) | set(config.settings.excluded_cpus(host)))
                     target = min(target, len(allowed_cpus(logical, excluded)))
                 except (httpx.HTTPError, ValueError):
                     log.warning("allocation poll failed; keeping target %d", target, exc_info=True)
@@ -692,7 +698,7 @@ def _supervise(cmd: list[str], n: int, *, server: str, token: str,
             time.sleep(1)
 
 
-def main(argv: list[str] | None = None, *, module: str = "core.jobs.remote_worker") -> int:
+def main(argv: list[str] | None = None, *, module: str = "orbit_jobs.remote_worker") -> int:
     """CLI entry. ``module`` is what ``--processes`` children run (the app
     composition root passes itself so the children register the kinds too)."""
     ap = argparse.ArgumentParser(description="Run jobs for a server on another machine.")

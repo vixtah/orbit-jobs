@@ -1,5 +1,5 @@
 """Remote job inputs: files a remote worker downloads before its handler runs
-(core.jobs.remote input roots, the input route, the worker's cache)."""
+(orbit_jobs.remote input roots, the input route, the worker's cache)."""
 
 from __future__ import annotations
 
@@ -7,15 +7,14 @@ import asyncio
 from pathlib import Path
 
 import httpx
+import orbit_jobs as jobs
+import orbit_jobs.remote as remote
+import orbit_jobs.remote_worker as remote_worker
 import pytest
 from fastapi import FastAPI
-
-import core.jobs.remote as remote
-import core.jobs.remote_worker as remote_worker
-from core import jobs
-from core.jobs.registry import KindDescriptor
-from core.jobs.store import get, insert
-from server.remote_worker_routes import router
+from orbit_jobs.registry import KindDescriptor
+from orbit_jobs.routes import remote_worker_router
+from orbit_jobs.store import get, insert
 
 TOKEN = "s3cret"
 HEAD = "a" * 40
@@ -40,7 +39,7 @@ def _artifact(rel: str, data: bytes) -> Path:
 
 def _app() -> FastAPI:
     app = FastAPI()
-    app.include_router(router)
+    app.include_router(remote_worker_router())
     return app
 
 

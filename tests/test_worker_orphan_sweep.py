@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import asyncio
 
-from core.jobs import worker
+from orbit_jobs import worker
 
 
 def test_the_sweep_keeps_running_while_the_worker_is_busy(monkeypatch):

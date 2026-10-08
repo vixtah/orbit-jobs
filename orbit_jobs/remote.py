@@ -1,7 +1,7 @@
 """Server side of remote workers: other machines run jobs over HTTP.
 
-A remote worker (``core.jobs.remote_worker``, e.g. a spare box on the
-tailnet) can't open ``tasks.db``, so the server claims, heartbeats and
+A remote worker (``orbit_jobs.remote_worker``, e.g. a spare box on the
+tailnet) can't open the server's database, so the server claims, heartbeats and
 finishes jobs on its behalf with the same store calls a local worker
 makes. The orphan sweep, retry and cancel paths therefore apply unchanged.
 
@@ -26,6 +26,10 @@ machine: ``artifacts`` (:func:`artifacts_root`) plus any a product registers
 (:func:`register_input_root`). The worker downloads each input before the
 handler starts, through ``GET /api/remote-workers/jobs/{id}/inputs``, which
 serves the file directly.
+
+A claimed or renewed lease calls the ``on_lease(job, worker_id)`` hook and a
+finished one ``on_lease_end(job, worker_id)`` (the host holds a machine's shared
+CPUs for its training jobs with them, ``core.compute_allocation``).
 """
 
 from __future__ import annotations
@@ -36,11 +40,11 @@ import subprocess
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
-from core.jobs import events
-from core.jobs.registry import get_descriptor
-from core.jobs.retry import maybe_retry
-from core.jobs.runner import emit_activity_for_job_finish
-from core.jobs.store import (
+from orbit_jobs import config, events
+from orbit_jobs.registry import get_descriptor
+from orbit_jobs.retry import maybe_retry
+from orbit_jobs.runner import emit_activity_for_job_finish
+from orbit_jobs.store import (
     TERMINAL_STATUSES,
     cancel_requested,
     claim_one,
@@ -82,45 +86,12 @@ def git_head() -> str | None:
     try:
         out = subprocess.run(
             ["git", "rev-parse", "HEAD"],
-            cwd=Path(__file__).resolve().parents[2],
+            cwd=config.settings.code_root or Path.cwd(),
             capture_output=True, text=True, timeout=5,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
     return out.stdout.strip() or None
-
-
-# A training job holds its machine's shared self-play/training CPUs while it runs
-# (core.compute_allocation): the machine's self-play drains and training gets the pool.
-POOL_CAPABILITY = "remote-gpu"
-
-
-def _pool_holder(job: dict) -> str:
-    return f"job {job['id']}"
-
-
-def _hold_pool(job: dict | None, worker_id: str) -> None:
-    """Claim (or renew) the worker's machine's pool for a training job it holds."""
-    if job is None or job.get("required_capability") != POOL_CAPABILITY:
-        return
-    from core.compute_allocation import claim_training
-
-    try:
-        claim_training(worker_id.split(":")[0], _pool_holder(job))
-    except ValueError:  # a worker id that names no machine: nothing to hold
-        log.warning("job %s: worker %r names no machine; its CPUs aren't held",
-                    job["id"], worker_id)
-
-
-def _release_pool(job: dict, worker_id: str) -> None:
-    if job.get("required_capability") != POOL_CAPABILITY:
-        return
-    from core.compute_allocation import release_training
-
-    try:
-        release_training(worker_id.split(":")[0], _pool_holder(job))
-    except ValueError:
-        pass
 
 
 def claim(
@@ -145,7 +116,7 @@ def claim(
     else:
         job = claim_one(capabilities, worker_id, code_version=code_version,
                         allow_unpinned=server_head is not None and code_version == server_head)
-    _hold_pool(job, worker_id)
+    config.settings.on_lease(job, worker_id)
     return job
 
 
@@ -176,7 +147,7 @@ def claim_compatible(
             stale.append(kind)
     job = claim_one(capabilities, worker_id, code_version=code_version, allow_unpinned=True,
                     kinds=compatible)
-    _hold_pool(job, worker_id)
+    config.settings.on_lease(job, worker_id)
     return job, stale
 
 
@@ -187,7 +158,7 @@ def job_heartbeat(job_id: int, worker_id: str, pid: int) -> dict:
     if owned:
         job = get(job_id)
         worker_heartbeat(worker_id, job["required_capability"], pid)
-        _hold_pool(job, worker_id)
+        config.settings.on_lease(job, worker_id)
     return {"owned": owned, "cancel": owned and cancel_requested(job_id)}
 
 
@@ -210,7 +181,7 @@ def finish(
         result, error = result or {}, None
     if not mark_terminal(job_id, status, result=result, error=error, worker_id=worker_id):
         return False
-    _release_pool(job, worker_id)
+    config.settings.on_lease_end(job, worker_id)
     if status == "failed":
         try:
             retry_id = maybe_retry(job, job.get("payload") or {})

@@ -14,13 +14,11 @@ from __future__ import annotations
 
 import asyncio
 
+import orbit_jobs as jobs
 import pytest
-
-from core import jobs
-from core.jobs import capture as _capture
-from core.jobs import events as _events
-from core.jobs import store as _store
-
+from orbit_jobs import capture as _capture
+from orbit_jobs import events as _events
+from orbit_jobs import store as _store
 
 # ── fixtures ─────────────────────────────────────────────────────────
 
@@ -29,9 +27,9 @@ from core.jobs import store as _store
 def clean_subscribers():
     """Reset the SSE subscriber pools (on the shared bus) between tests."""
     def _reset():
-        _events._bus._topics.clear()
-        _events._bus._firehose.clear()
-        _events._bus._warned.clear()
+        _events._the_bus()._topics.clear()
+        _events._the_bus()._firehose.clear()
+        _events._the_bus()._warned.clear()
     _reset()
     yield
     _reset()
@@ -57,7 +55,7 @@ def test_cancel_propagates_through_awaiting_handler():
             raise
         _capture.end_step(bucket, "ok", ms=1)
 
-    from core.jobs.registry import KindDescriptor
+    from orbit_jobs.registry import KindDescriptor
     jobs.register_kind(KindDescriptor(
         kind="test_cancel", label="t", description="t", handler=slow_handler,
     ))
@@ -98,7 +96,7 @@ def test_sse_event_sequence(clean_subscribers):
         _capture.end_step(bucket, "ok", ms=12, output_text="out_a")
         return {"ok": True}
 
-    from core.jobs.registry import KindDescriptor
+    from orbit_jobs.registry import KindDescriptor
     jobs.register_kind(KindDescriptor(
         kind="test_sse", label="t", description="t", handler=handler,
     ))
@@ -176,7 +174,7 @@ def test_record_llm_and_io_propagate_through_to_thread():
         _capture.end_step(bucket, "ok", ms=10, output_text="done")
         return {"ok": True}
 
-    from core.jobs.registry import KindDescriptor
+    from orbit_jobs.registry import KindDescriptor
     jobs.register_kind(KindDescriptor(
         kind="test_to_thread", label="t", description="t", handler=handler,
     ))
@@ -212,7 +210,7 @@ def _mk_job(kind, subject_id, status, *, age_days=0.0):
     ts = (
         datetime.now(timezone.utc) - timedelta(days=age_days)
     ).isoformat()
-    from core.db import get_db
+    from orbit_jobs.db import get_db
     with get_db() as conn:
         conn.execute(
             "UPDATE jobs SET status = ?, created_at = ? WHERE id = ?",
@@ -222,7 +220,7 @@ def _mk_job(kind, subject_id, status, *, age_days=0.0):
 
 
 def _job_ids():
-    from core.db import get_db
+    from orbit_jobs.db import get_db
     with get_db() as conn:
         return {r["id"] for r in conn.execute("SELECT id FROM jobs")}
 
@@ -283,7 +281,7 @@ def test_clear_superseded_zombie_clause_sweeps_old_rows():
 
 def test_clear_superseded_deletes_step_rows_too():
     """Swept jobs take their job_steps along — no orphaned step rows."""
-    from core.db import get_db
+    from orbit_jobs.db import get_db
 
     swept_job = _mk_job("classify_thread", "imsg:6", "failed", age_days=2)
     _store.insert_step(swept_job, "classify")
@@ -383,7 +381,7 @@ def test_clear_superseded_phases_3_and_4_durable_if_phase5_raises(monkeypatch):
     # Phases 3 and 4 already committed the job + its step's deletion
     # before phase 5 ran.
     assert swept_job not in _job_ids()
-    from core.db import get_db
+    from orbit_jobs.db import get_db
     with get_db() as conn:
         remaining_steps = conn.execute(
             "SELECT COUNT(*) AS n FROM job_steps WHERE job_id = ?", (swept_job,),

@@ -6,8 +6,9 @@ until a hint arrives, ``stop_event`` is set, or their usual poll interval
 passes. The hint carries no job: the worker still claims through the atomic
 ``claim_one``, so a lost or duplicate hint only changes how soon a job starts.
 
-Transport is ``core.mesh`` (subjects ``<prefix>.work.<capability>``); without
-``NATS_URLS`` nothing is sent and workers simply poll as before.
+Transport is the configured ``config.settings.transport`` (the host's
+``core.mesh``: subjects ``<prefix>.work.<capability>``); without one (or, in the
+host, without ``NATS_URLS``) nothing is sent and workers simply poll as before.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterable
 
-from core import mesh
+from orbit_jobs import config
 
 __all__ = ["notify", "listen", "unlisten", "idle"]
 
@@ -23,6 +24,7 @@ __all__ = ["notify", "listen", "unlisten", "idle"]
 def notify(capability: str | None) -> None:
     """Tell workers of ``capability`` that a job is waiting."""
     if capability:
+        mesh = config.settings.transport
         mesh.publish(mesh.subject("work", capability), {"capability": capability})
 
 
@@ -31,12 +33,14 @@ def listen(capabilities: Iterable[str], event: asyncio.Event, *, key: str) -> No
 
     ``include_own``: a server or test process may spawn and run in one process.
     """
+    mesh = config.settings.transport
     for capability in capabilities:
         mesh.subscribe(mesh.subject("work", capability), lambda _data, _origin: event.set(),
                        key=f"{key}:{capability}", include_own=True)
 
 
 def unlisten(capabilities: Iterable[str], *, key: str) -> None:
+    mesh = config.settings.transport
     for capability in capabilities:
         mesh.unsubscribe(f"{key}:{capability}")
 

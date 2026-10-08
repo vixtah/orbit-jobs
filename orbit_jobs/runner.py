@@ -13,10 +13,11 @@ import asyncio
 import logging
 from typing import Any
 
-from core.jobs import events
-from core.jobs.capture import JobHandle, clear_handle, current, start_handle
-from core.jobs.registry import get_descriptor
-from core.jobs.store import (
+from orbit_jobs import config, events
+from orbit_jobs.capture import JobHandle, clear_handle, current, start_handle
+from orbit_jobs.db import get_db
+from orbit_jobs.registry import get_descriptor
+from orbit_jobs.store import (
     get_workflow_id,
     has_active_for_subject,
     insert,
@@ -69,7 +70,7 @@ def spawn(
     iOS app, and CLI keep working unchanged.
 
     ``origin`` records who/what kicked off the job — see
-    :mod:`core.jobs.schema` for the value vocabulary. Resolution rules:
+    :mod:`orbit_jobs.schema` for the value vocabulary. Resolution rules:
 
     1. Caller passed an explicit ``origin`` → use it.
     2. Else if ``parent_job_id`` is set → inherit the parent's origin.
@@ -215,7 +216,6 @@ def _origin_of(job_id: int) -> str | None:
     """Look up a job's origin (used by spawn() to inherit). ``None`` if
     the row doesn't exist (shouldn't happen in practice — ``spawn``
     always inserts before caller can reference)."""
-    from core.db import get_db
     with get_db() as conn:
         row = conn.execute(
             "SELECT origin FROM jobs WHERE id = ?", (job_id,),
@@ -276,8 +276,8 @@ async def _execute(
         "error": final_error,
         "result": final_result,
     })
-    # Mirror to the unified activity feed for the chat_turn / digest_run
-    # cases users typically care about. Best-effort — never raise.
+    # The on_job_finished hook (the host's activity feed). Best-effort —
+    # never raise.
     emit_activity_for_job_finish(
         job_id=job_id,
         kind=kind,
@@ -293,56 +293,11 @@ def emit_activity_for_job_finish(
     status: str | None,
     error: str | None,
 ) -> None:
+    """Tell the configured ``on_job_finished`` hook a job reached a terminal
+    status (the host mirrors some kinds into its activity feed). Best-effort —
+    never raises."""
     try:
-        from core.events.feed import emit as activity_emit
-        from core.jobs.store import get as get_job
-    except Exception:  # noqa: BLE001
-        return
-    try:
-        # Pull subject for richer titles; tolerate missing row.
-        job = get_job(job_id) or {}
-        subject_type = job.get("subject_type")
-        subject_id = job.get("subject_id")
-        if kind == "chat_turn":
-            if status == "succeeded":
-                activity_emit(
-                    event_type="chat_turn.finished",
-                    title=f"Draft ready · {subject_id or 'chat'}",
-                    detail=None,
-                    subject_type=subject_type,
-                    subject_id=subject_id,
-                    payload={"job_id": job_id, "status": status},
-                )
-            elif status == "failed":
-                activity_emit(
-                    event_type="chat_turn.failed",
-                    title=f"Draft failed · {subject_id or 'chat'}",
-                    detail=error,
-                    subject_type=subject_type,
-                    subject_id=subject_id,
-                    payload={"job_id": job_id, "status": status},
-                )
-        elif kind == "digest_run":
-            activity_emit(
-                event_type=f"digest_run.{status}" if status else "digest_run.finished",
-                title=f"{subject_id} {status or 'finished'}",
-                detail=error,
-                subject_type=subject_type,
-                subject_id=subject_id,
-                payload={"job_id": job_id, "status": status},
-            )
-        elif kind in ("assistant_thread", "create_event"):
-            # Lower-noise events; only log failures so the feed stays
-            # focused on user-relevant outcomes.
-            if status == "failed":
-                activity_emit(
-                    event_type=f"{kind}.failed",
-                    title=f"{kind} failed · {subject_id or job_id}",
-                    detail=error,
-                    subject_type=subject_type,
-                    subject_id=subject_id,
-                    payload={"job_id": job_id},
-                )
+        config.settings.on_job_finished(job_id=job_id, kind=kind, status=status, error=error)
     except Exception:  # noqa: BLE001
         # Activity emission is best-effort.
         pass

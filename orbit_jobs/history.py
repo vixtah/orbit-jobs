@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from core.db import get_db
+from orbit_jobs.db import get_db
 
 
 def has_succeeded_for_subject(
