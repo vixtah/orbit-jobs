@@ -62,6 +62,8 @@ FAST_FAILURE_SECONDS = 60.0
 MAX_FAST_FAILURES = 3
 FAST_FAILURE_PAUSE_SECONDS = 15 * 60.0
 MAX_FAST_FAILURE_PAUSE_SECONDS = 2 * 3600.0
+# The supervisor ticks every second: an error that persists is logged again at most this often.
+REPEAT_LOG_SECONDS = 600.0
 
 
 def _work_root() -> Path:
@@ -333,6 +335,26 @@ async def _finish(client: httpx.AsyncClient, job_id: int, worker_id: str, status
         log.info("job %s %s", job_id, status)
 
 
+def _ready_protocols(descriptors) -> dict[str, int]:
+    """Protocol versions of the kinds this process can run. A kind whose ``ready`` check
+    fails (or raises) is left out, so it stays queued for another worker instead of
+    failing here. Each check runs once; each distinct reason is logged once."""
+    reasons: dict = {None: None}
+    blocked: dict[str, list[str]] = {}
+    for d in descriptors:
+        if d.ready not in reasons:
+            try:
+                reasons[d.ready] = d.ready()
+            except Exception as exc:  # noqa: BLE001 — a broken check must not claim
+                log.exception("readiness check for %s failed", d.kind)
+                reasons[d.ready] = f"readiness check failed: {type(exc).__name__}: {exc}"
+        if reasons[d.ready]:
+            blocked.setdefault(reasons[d.ready], []).append(d.kind)
+    for reason, kinds in blocked.items():
+        log.error("not claiming %s: %s", ", ".join(kinds), reason)
+    return {d.kind: d.protocol for d in descriptors if not reasons[d.ready]}
+
+
 async def run_remote_worker(
     client: httpx.AsyncClient,
     capabilities: list[str],
@@ -358,7 +380,7 @@ async def run_remote_worker(
     # Protocol version of every kind this process can run: the server hands it
     # any unpinned job (of its capabilities) whose kind version matches,
     # whatever commit either side is on.
-    protocols = {d.kind: d.protocol for d in list_descriptors()}
+    protocols = _ready_protocols(list_descriptors())
     claim_body = {"worker_id": worker_id, "capabilities": capabilities,
                   "pid": os.getpid(), "code_version": code_version, "protocols": protocols}
     reported_stale: list[str] = []
@@ -580,17 +602,40 @@ class WorkerPool:
         self.cmd, self.directory, self.logical = cmd, directory, logical
         self.children: list[tuple[subprocess.Popen, Path]] = []
         self._pinned: list[int] | None = None  # the exclusions the supervisor is pinned for
+        self._warned: set[tuple[str, int]] = set()  # failures already logged, by pid
 
     @property
     def running(self) -> int:
         return sum(proc.poll() is None for proc, _ in self.children)
 
+    def _failed(self, what: str, pid: int, exc: BaseException) -> None:
+        """Log a failure about ``pid`` once while it lasts; repeats go to debug."""
+        level = logging.DEBUG if (what, pid) in self._warned else logging.WARNING
+        self._warned.add((what, pid))
+        log.log(level, "%s %d failed (%s: %s); skipping it", what, pid, type(exc).__name__, exc)
+
+    def _pin(self, pid: int, excluded: list[int]) -> bool:
+        """Best effort: a process that can't be pinned (exited, access denied) is skipped,
+        never a reason to stop managing the pool (2026-10-07: one WinError 5 here wedged
+        the PC's pool for hours)."""
+        try:
+            apply_affinity(pid, excluded, self.logical)
+        except ProcessLookupError:
+            return False  # it exited meanwhile; reap on the next pass
+        except (OSError, ValueError) as exc:
+            self._failed("setting CPU affinity of process", pid, exc)
+            return False
+        self._warned.discard(("setting CPU affinity of process", pid))
+        return True
+
     def reconcile(self, target: int, excluded: list[int]) -> None:
         # The supervisor itself stays on the allowed CPUs too (VictorHyte's faulty cores
-        # must run nothing), and its children inherit that mask when they are spawned.
-        if sys.platform != "darwin" and self._pinned != sorted(excluded):
-            apply_affinity(0, excluded, self.logical)
-            self._pinned = sorted(excluded)
+        # must run nothing), and its children inherit that mask when they are spawned. A
+        # child spawned while that fails would start on the faulty cores, so none is
+        # spawned until it works; reaping, draining and pinning still go on.
+        pinned = sys.platform == "darwin" or self._pinned == sorted(excluded)
+        if not pinned and self._pin(0, excluded):
+            self._pinned, pinned = sorted(excluded), True
         live = []
         for proc, stop in self.children:
             if proc.poll() is None:
@@ -603,18 +648,20 @@ class WorkerPool:
             stop.touch()
         # Also update existing processes when exclusions change: on Windows the worker
         # behind each venv launcher too (it inherited the old mask when it started).
+        seen = {0}
         for proc, _ in live:
             pids = [proc.pid]
             if sys.platform == "win32":
                 try:
                     pids += _win_descendants(proc.pid)
-                except OSError:
-                    log.warning("could not list worker %d's processes", proc.pid, exc_info=True)
+                except OSError as exc:
+                    self._failed("listing the processes of worker", proc.pid, exc)
+            seen.update(pids)
             for pid in pids:
-                try:
-                    apply_affinity(pid, excluded, self.logical)
-                except ProcessLookupError:
-                    pass  # it exited meanwhile; reap on the next pass
+                self._pin(pid, excluded)
+        self._warned = {key for key in self._warned if key[1] in seen}
+        if not pinned:
+            return
         # Draining processes occupy their slots until they really exit.
         for _ in range(max(0, target - len(live))):
             stop = self.directory / uuid.uuid4().hex
@@ -654,6 +701,7 @@ def _supervise(cmd: list[str], n: int, *, server: str, token: str,
     ) as client:
         pool = WorkerPool(cmd, Path(directory), logical)
         next_poll = 0.0
+        last_error, logged_at = None, 0.0  # the reconcile failure last logged, and when
         while True:
             if stopping:
                 pool.drain()
@@ -688,13 +736,20 @@ def _supervise(cmd: list[str], n: int, *, server: str, token: str,
                     excluded = sorted(
                         set(allocation["excluded_cpus"]) | set(config.settings.excluded_cpus(host)))
                     target = min(target, len(allowed_cpus(logical, excluded)))
-                except (httpx.HTTPError, ValueError):
+                except Exception:  # noqa: BLE001 — the supervisor must outlive any bad poll
                     log.warning("allocation poll failed; keeping target %d", target, exc_info=True)
                 next_poll = time.monotonic() + random.uniform(25, 35)
+            # Any failure is retried next second: an exception escaping here would end the
+            # supervisor and leave its workers running with nobody to replace them.
             try:
                 pool.reconcile(target, excluded)
-            except (OSError, ValueError, RuntimeError):
-                log.exception("could not reconcile worker pool; retrying")
+            except Exception as exc:  # noqa: BLE001
+                error = f"{type(exc).__name__}: {exc}"
+                if error != last_error or time.monotonic() - logged_at >= REPEAT_LOG_SECONDS:
+                    log.exception("could not reconcile worker pool; retrying every second")
+                    last_error, logged_at = error, time.monotonic()
+            else:
+                last_error = None
             time.sleep(1)
 
 

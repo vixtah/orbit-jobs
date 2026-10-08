@@ -457,3 +457,42 @@ def test_a_running_job_publishes_its_progress_file_before_it_finishes(tmp_path, 
     asyncio.run(_run_until(lambda: get(job_id)["status"] == "succeeded"))
     assert get(job_id)["result"]["seen"] == '{"epochs": [{"epoch": 1}]}'
     assert job_id not in remote_worker._LIVE_ARTIFACTS  # forgotten once the job ends
+
+
+def test_a_kind_that_is_not_ready_here_stays_queued_for_another_worker(caplog):
+    """A worker that can't run a kind (e.g. its native engine is older than its checkout)
+    leaves it unclaimed instead of failing it; its other kinds still run."""
+    checks = []
+
+    def stale():
+        checks.append(1)
+        return "engine build is stale: rebuild it"
+
+    async def must_not_run(job_id, payload):
+        raise AssertionError("claimed a kind that isn't ready")
+
+    _register("ready_blocked_a", must_not_run, capability="remote-test", ready=stale)
+    _register("ready_blocked_b", must_not_run, capability="remote-test", ready=stale)
+    _register("ready_ok", _noop, capability="remote-test", ready=lambda: None)
+    blocked = [insert(k, {}, required_capability="remote-test")
+               for k in ("ready_blocked_a", "ready_blocked_b")]
+    ok = insert("ready_ok", {}, required_capability="remote-test")
+
+    with caplog.at_level("ERROR", logger="jobs.remote_worker"):
+        asyncio.run(_run_until(lambda: get(ok)["status"] == "succeeded"))
+    assert [get(i)["status"] for i in blocked] == ["pending", "pending"]
+    assert checks == [1]  # one check per process, however many kinds share it
+    [record] = [r for r in caplog.records if "not claiming" in r.getMessage()]
+    assert "ready_blocked_a, ready_blocked_b" in record.getMessage()
+    assert "engine build is stale" in record.getMessage()
+
+
+def test_a_readiness_check_that_raises_counts_as_not_ready(caplog):
+    def broken():
+        raise RuntimeError("cannot tell")
+
+    _register("ready_broken", _noop, capability="remote-test", ready=broken)
+    with caplog.at_level("ERROR", logger="jobs.remote_worker"):
+        protocols = remote_worker._ready_protocols([jobs.get_descriptor("ready_broken")])
+    assert protocols == {}
+    assert "cannot tell" in caplog.text

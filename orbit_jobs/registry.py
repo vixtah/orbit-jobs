@@ -17,6 +17,9 @@ state:
 - ``protocol`` — version of the kind's contract with a remote worker (payload
   in, result out). Remote workers advertise theirs and only claim jobs whose
   kind matches the server's, so they keep working across unrelated commits.
+- ``ready`` — optional check a remote worker runs before offering the kind:
+  ``None`` when this process can run it, else why not. A kind that isn't
+  ready is left unclaimed (never failed).
 
 This is the choke point that makes "how does this kind look in the UI"
 a registration-time question, not a per-spawn-call question. See
@@ -64,6 +67,11 @@ class KindDescriptor:
     # (they log it and restart once their checkout moves). Only remote-*
     # kinds use it today.
     protocol: int = 1
+    # Remote workers only: called once per worker process (results are cached per
+    # function); returns None when this process can run the kind, else the reason it
+    # can't (e.g. a native extension built from other sources than the checkout's).
+    # The worker then leaves the kind out of its claims and logs the reason.
+    ready: Callable[[], str | None] | None = None
 
     def resolve_capability(self, payload: dict[str, Any]) -> str | None:
         """Expand a capability template against the spawn payload.
