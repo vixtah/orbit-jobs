@@ -1,8 +1,11 @@
-"""Optional NATS link between this app's processes and machines.
+"""Optional NATS link between processes and machines: the transport for job wake-ups
+(``orbit_jobs.configure(transport=orbit_jobs.mesh)``), and for anything else a host
+bridges over it (an event bus, request/reply).
 
-A leaf: it imports nothing from ``core`` features, so the event bus, the job
+A leaf: it imports nothing from orbit_jobs or a host, so the event bus, the job
 store and the workers can all use it. Off unless ``NATS_URLS`` is set; every
-function is then a cheap no-op and the app behaves exactly as without it.
+function is then a cheap no-op and the process behaves exactly as without it.
+Needs ``nats-py`` (extra ``mesh``) only when ``NATS_URLS`` is set.
 
 NATS here is an accelerator, never a source of truth. Messages are
 fire-and-forget hints (a live event, "work is waiting"); anything that must

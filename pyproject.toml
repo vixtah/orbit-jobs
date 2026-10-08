@@ -11,6 +11,11 @@ dependencies = []
 remote = ["httpx>=0.28"]
 # orbit_jobs.routes (the FastAPI router a server mounts for remote workers).
 server = ["fastapi>=0.135.3"]
+# orbit_jobs.mesh (the optional NATS transport: wake-ups, bus bridging, request/reply).
+mesh = ["nats-py>=2.11"]
+
+[dependency-groups]
+dev = ["orbit-jobs[remote,server,mesh]", "pytest>=9.0.3", "pytest-timeout>=2.3"]
 
 [build-system]
 requires = ["hatchling"]
@@ -19,7 +24,7 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["orbit_jobs"]
 
-# Standalone: `cd packages/orbit-jobs && python -m pytest` (no host plugin).
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 timeout = 300
+markers = ["integration: needs a real subprocess or nats-server"]

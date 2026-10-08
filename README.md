@@ -3,11 +3,20 @@
 A SQLite-backed job queue with capability-scoped workers, per-step telemetry and
 remote workers over HTTP. Import package: `orbit_jobs`. The queue, local worker and
 telemetry need only the standard library (Python 3.12+); the remote worker needs
-`httpx` (extra `remote`) and the server routes need FastAPI (extra `server`).
+`httpx` (extra `remote`), the server routes need FastAPI (extra `server`) and the
+optional NATS transport needs `nats-py` (extra `mesh`).
 
-It was extracted from the automations host (`core/jobs`) so the host and the
-Riftbound product can share one bounded job package. It imports nothing from
-either; an import-linter contract in the root `pyproject.toml` enforces that.
+It was extracted from the automations monorepo (`core/jobs`, `core/mesh.py`) so the
+automations assistant and Riftbound, now separate repositories, share one bounded job
+package. It imports nothing from either. Both depend on it by git tag:
+
+```toml
+[project]
+dependencies = ["orbit-jobs[remote,server,mesh]"]
+
+[tool.uv.sources]
+orbit-jobs = { git = "https://github.com/vixtah/orbit-jobs", tag = "v0.1.0" }
+```
 
 ## Public API
 
@@ -40,6 +49,11 @@ job_id = spawn("double", {"n": 21})        # pending until a "cpu" worker claims
 - `orbit_jobs.source` — `git archive` of a commit, for workers without git.
 - `orbit_jobs.runctx` — the active-job ContextVar domain code reads (`current()`)
   without importing the job system.
+- `orbit_jobs.mesh` — the optional NATS link (`NATS_URLS`; off and free without it):
+  `publish` / `subscribe` hints, `serve` / `request_sync` request-reply, `start` /
+  `stop`. Pass it as the `transport` hook for instant worker wake-ups. Subjects are
+  `<NATS_SUBJECT_PREFIX>.<tokens>` (default prefix `automations`, kept so processes
+  of both repositories on one NATS server keep talking to each other).
 - `orbit_jobs.schema.register_schema(conn)` — the `jobs`, `job_steps`,
   `job_cancel_requests`, `worker_heartbeats` (and orphaned `remote_input_mirror`)
   tables.
@@ -53,7 +67,7 @@ records its code version on import). Every hook has a self-contained default.
 |------|---------|--------------------------------------------|
 | `get_db`, `now_iso` | own SQLite file (`ORBIT_JOBS_DB`, default `~/.local/share/orbit-jobs/jobs.db`; WAL, 30 s busy timeout, tables created on open), UTC clock | `core.db.get_db` / `now_iso` (tasks.db) |
 | `make_bus(name, queue_size=)` | in-process bus (`orbit_jobs.bus`) | `core.events.bus.Bus` (bridged over NATS) |
-| `transport` | none: workers poll | `core.mesh` (instant wake-ups) |
+| `transport` | none: workers poll | `orbit_jobs.mesh` (instant wake-ups) |
 | `on_job_finished(job_id=, kind=, status=, error=)` | nothing | activity feed (`core.events.feed`) |
 | `reap_children()` | nothing | `kill_child_process_tree` (Playwright) |
 | `pause_claiming(capabilities)` | never | ollama workers pause while voice is busy |
@@ -71,57 +85,34 @@ connector.
 
 ## Not included
 
-- The fleet (`core/fleet`), compute allocation and the NATS mesh (`core/mesh.py`)
-  stay in the host and will move with Riftbound; they plug in through the hooks.
-- Host read models: Tickets views over chats (`core.jobs.views`), the fleet's
-  per-machine activity and `compute_hosts` (`core.jobs.activity`), the host's
-  worker list (`core.jobs.capabilities`) and spawn kill switches
-  (`core.jobs.spawn_config`).
+- The training fleet, compute allocation and Riftbound's remote-worker routes live in
+  the Riftbound repository and plug in through the hooks.
+- Host read models (Tickets views, the host's worker list, spawn kill switches).
 - Job kinds. Composition roots register them.
 
-## In the automations host
+## Composition roots
 
-`core.jobs` is the host facade. Importing it calls `core.jobs.host.install()`, and
-each moved module path (`core.jobs.store`, `core.jobs.worker`, ...) and
-`core.runctx` is a stub that replaces itself in `sys.modules` with the
-`orbit_jobs` module, so both names are the same module object and
-`monkeypatch.setattr` works on either.
+- **automations**: `core.jobs` is the host facade. Importing it calls
+  `core.jobs.host.install()`, and each moved module path (`core.jobs.store`,
+  `core.jobs.worker`, ..., `core.runctx`, `core.mesh`) is a stub that replaces itself in
+  `sys.modules` with the `orbit_jobs` module, so both names are the same module object
+  and `monkeypatch.setattr` works on either.
+- **riftbound**: `riftbound.jobs_host.install()` (its own job database, the mesh,
+  compute allocation), called by every Riftbound entry point.
 
 ## Tests
 
 ```bash
-cd packages/orbit-jobs && python -m pytest      # standalone, no host plugin
+uv sync && uv run pytest        # standalone, no host
 ```
 
 `tests/test_standalone.py` runs a job end to end in a subprocess with only this
-package on the path and no site-packages. The root suite also collects these tests.
+package on the path and no site-packages. `tests/test_mesh.py` starts a throwaway
+`nats-server` when one is installed (`brew install nats-server`) and skips otherwise.
 
-## Deploying the split (once)
+## Releasing
 
-Every interpreter that imports `core` needs `orbit_jobs` importable; without it
-`core.jobs` and `core.runctx` fail to import. Don't `uv sync` the Mac's main
-checkout (its `.venv` carries torch from the `train` group).
-
-- **Mac, main checkout** — merge and install in one go, then restart:
-
-  ```bash
-  cd ~/Projects/automations
-  git merge jobs-package \
-    && uv pip install --python .venv/bin/python -e packages/orbit-jobs --no-deps \
-    && uv pip install --python .venv-voice/bin/python -e packages/orbit-jobs --no-deps
-  .venv/bin/python -c "import core.jobs, core.runctx, orbit_jobs.runctx as r; assert core.runctx is r"
-  .venv-voice/bin/python -c "import core.runctx"
-  ```
-
-  Then restart the web server, the workers and the voice sidecar. Workers that
-  notice the new commit on their own exec only after `import app.kinds` succeeds in
-  a fresh interpreter, so they wait for the install instead of crashing.
-- **Riftbound thinker checkouts** (`rb-think`, their own `.venv`): `uv sync` as usual
-  when moved to the new commit.
-- **VPS**: `deploy/vps/deploy.sh` runs `uv sync --frozen --no-dev --package riftbound`,
-  which installs `orbit-jobs` (a riftbound dependency) and import-checks.
-- **Remote worker machines** (`victorhyte`): `uv sync` (with the extras that machine
-  uses, e.g. `--all-packages --extra train`) or
-  `uv pip install -e packages/orbit-jobs --no-deps` right after pushing the commit:
-  workers exit when the checkout moves and fail on `import orbit_jobs` until then.
-  Fleet nodes run `uv sync --frozen` at boot and need nothing.
+Tag a version (`git tag v0.1.1 && git push origin v0.1.1`), then bump the `tag` in each
+consumer's `[tool.uv.sources]` and `uv lock --upgrade-package orbit-jobs` there.
+Installed environments that don't `uv sync` (the Mac's `.venv-voice`) need
+`uv pip install "orbit-jobs @ git+https://github.com/vixtah/orbit-jobs@v0.1.1"`.
