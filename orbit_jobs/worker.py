@@ -80,6 +80,10 @@ IDLE_SLEEP_SECONDS = 1.0
 # after startup — guards against an edit-time race where the code mtime
 # bumps right after import and triggers an immediate exec loop.
 MIN_UPTIME_BEFORE_RESTART = 30.0
+# How often an idle worker looks for new code. The check runs ``git
+# rev-parse`` and stats every .py under ``code_dirs``; doing that on every
+# 1 s idle tick in a dozen workers was a steady CPU load for nothing.
+CODE_CHECK_INTERVAL_SECONDS = 30.0
 
 # Marks a code version derived without a git HEAD.
 _NO_GIT = "nogit"
@@ -141,6 +145,7 @@ def _dirty_digest(repo_root: Path) -> str:
 
 _STARTUP_VERSION = current_code_version()
 _STARTUP_TS = time.monotonic()
+_LAST_CODE_CHECK = float("-inf")
 
 # When True (set by ``main()``, i.e. a real subprocess worker), a job
 # that ends user-cancelled or timed-out triggers an os.execv into a
@@ -176,8 +181,13 @@ def _maybe_exec_for_new_code() -> None:
 
     Uses ``os.execv`` so the PID is preserved (no supervisor required).
     """
-    if time.monotonic() - _STARTUP_TS < MIN_UPTIME_BEFORE_RESTART:
+    global _LAST_CODE_CHECK
+    now = time.monotonic()
+    if now - _STARTUP_TS < MIN_UPTIME_BEFORE_RESTART:
         return
+    if now - _LAST_CODE_CHECK < CODE_CHECK_INTERVAL_SECONDS:
+        return
+    _LAST_CODE_CHECK = now
     try:
         cur = current_code_version()
     except Exception:

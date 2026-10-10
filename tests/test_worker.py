@@ -36,6 +36,8 @@ def _never_exec_the_test_process(monkeypatch):
     because their monkeypatch runs after this fixture.
     """
     monkeypatch.setattr(worker_module.os, "execv", lambda *a, **k: None)
+    # Each test starts with the code check due (it's throttled per process).
+    monkeypatch.setattr(worker_module, "_LAST_CODE_CHECK", float("-inf"))
 
 
 def _row_status(job_id: int) -> dict:
@@ -673,3 +675,22 @@ def test_heartbeat_and_cancel_requested_run_off_event_loop_thread(monkeypatch):
             )
     finally:
         _delete(job_id)
+
+
+def test_code_drift_check_runs_at_most_every_interval(monkeypatch):
+    """The idle loop calls this every tick; the git + file-stat check itself
+    runs at most once per CODE_CHECK_INTERVAL_SECONDS."""
+    calls = []
+    monkeypatch.setattr(worker_module, "_STARTUP_TS", 0.0)
+    monkeypatch.setattr(worker_module, "_STARTUP_VERSION", "aaaaaaaaaaaa+1111")
+    monkeypatch.setattr(worker_module, "current_code_version",
+                        lambda: calls.append(1) or "aaaaaaaaaaaa+1111")
+    clock = [1000.0]
+    monkeypatch.setattr(worker_module.time, "monotonic", lambda: clock[0])
+    for _ in range(5):
+        worker_module._maybe_exec_for_new_code()
+        clock[0] += 1.0
+    assert len(calls) == 1
+    clock[0] += worker_module.CODE_CHECK_INTERVAL_SECONDS
+    worker_module._maybe_exec_for_new_code()
+    assert len(calls) == 2

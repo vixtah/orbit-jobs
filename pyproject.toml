@@ -1,6 +1,6 @@
 [project]
 name = "orbit-jobs"
-version = "0.1.0"
+version = "0.1.1"
 description = "SQLite job queue with capability workers and HTTP remote workers"
 requires-python = ">=3.12"  # the voice sidecar (.venv-voice, 3.12) imports core.runctx
 # The queue, local worker and telemetry need only the standard library.
