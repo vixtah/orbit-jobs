@@ -265,6 +265,20 @@ async def _run_job(client: httpx.AsyncClient, job: dict, worker_id: str) -> str 
             result, status, error = None, "failed", f"{type(exc).__name__}: {exc}"
         if reason == "lease lost":
             return None  # the server already finished the row; nothing to report
+        # Handlers may write their final progress during failure/cancellation cleanup.
+        # Flush it while the lease is still running; a short job can finish before
+        # its first periodic heartbeat. Advisory uploads never change job status.
+        # Skip files already scheduled for the normal successful-result upload;
+        # large checkpoints must not be transferred twice.
+        final_sent = {}
+        final_artifacts = result.get("artifacts", {}) if status == "succeeded" and isinstance(result, dict) else {}
+        for name, local in _LIVE_ARTIFACTS.get(job_id, {}).items():
+            if str(final_artifacts.get(name)) == local:
+                try:
+                    final_sent[name] = os.stat(local).st_mtime
+                except OSError:
+                    pass
+        await _push_live_artifacts(client, job_id, worker_id, final_sent)
         if status == "succeeded" and isinstance(result, dict) and result.get("artifacts"):
             try:
                 uploaded = await _upload_artifacts(client, job_id, worker_id, result["artifacts"])

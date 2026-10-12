@@ -496,3 +496,56 @@ def test_a_readiness_check_that_raises_counts_as_not_ready(caplog):
         protocols = remote_worker._ready_protocols([jobs.get_descriptor("ready_broken")])
     assert protocols == {}
     assert "cannot tell" in caplog.text
+
+@pytest.mark.parametrize('fails',[False,True])
+def test_final_live_progress_is_flushed_before_first_heartbeat_even_on_failure(tmp_path,monkeypatch,fails):
+    monkeypatch.setenv('REMOTE_ARTIFACTS_DIR',str(tmp_path/'received'))
+    monkeypatch.setattr(remote_worker,'HEARTBEAT_INTERVAL_SECONDS',100)
+    async def handler(job_id,payload):
+        local=tmp_path/'timing.json';local.write_text('started')
+        remote_worker.publish_while_running(job_id,f'timings/job-{job_id}.json',local)
+        try:
+            if fails:raise RuntimeError('failed check')
+            return {'ok':True}
+        finally:local.write_text('finished')
+    _register('test_final_progress',handler,capability='remote-test')
+    job_id=jobs.spawn('test_final_progress',{})
+    asyncio.run(_run_until(lambda:get(job_id)['status'] in ('failed','succeeded')))
+    assert get(job_id)['status']==('failed' if fails else 'succeeded')
+    assert (tmp_path/f'received/timings/job-{job_id}.json').read_text()=='finished'
+
+
+def test_successful_live_file_in_result_is_uploaded_only_once(tmp_path,monkeypatch):
+    monkeypatch.setenv('REMOTE_ARTIFACTS_DIR',str(tmp_path/'received'))
+    monkeypatch.setattr(remote_worker,'HEARTBEAT_INTERVAL_SECONDS',100)
+    writes=[]
+    original=remote.store_artifact
+    def store(*args,**kwargs):
+        writes.append(args[2]);return original(*args,**kwargs)
+    monkeypatch.setattr(remote,'store_artifact',store)
+    async def handler(job_id,payload):
+        local=tmp_path/'timing.json';local.write_text('finished')
+        name=f'timings/job-{job_id}.json'
+        remote_worker.publish_while_running(job_id,name,local)
+        return {'artifacts':{name:str(local)}}
+    _register('test_dedup_final',handler,capability='remote-test')
+    job_id=jobs.spawn('test_dedup_final',{})
+    asyncio.run(_run_until(lambda:get(job_id)['status']=='succeeded'))
+    assert writes==[f'timings/job-{job_id}.json']
+    assert not (tmp_path/'timing.json').exists()
+
+
+def test_final_progress_is_flushed_after_cancellation_cleanup(tmp_path,monkeypatch):
+    monkeypatch.setenv('REMOTE_ARTIFACTS_DIR',str(tmp_path/'received'))
+    async def handler(job_id,payload):
+        local=tmp_path/'timing.json';local.write_text('started')
+        remote_worker.publish_while_running(job_id,f'timings/job-{job_id}.json',local)
+        try:await asyncio.sleep(100)
+        finally:local.write_text('interrupted')
+    _register('test_cancel_progress',handler,capability='remote-test')
+    job_id=jobs.spawn('test_cancel_progress',{})
+    def done():
+        if (tmp_path/'timing.json').exists():request_cancel(job_id)
+        return get(job_id)['status']=='cancelled'
+    asyncio.run(_run_until(done))
+    assert (tmp_path/f'received/timings/job-{job_id}.json').read_text()=='interrupted'
