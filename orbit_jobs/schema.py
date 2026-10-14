@@ -1,4 +1,4 @@
-"""DDL for the jobs + job_steps tables.
+"""DDL for the job tables (jobs, job_steps, ...) and the schedule tables.
 
 The module owns its own schema. ``register_schema(conn)`` is called
 from the configured ``get_db`` on every connection (the host's
@@ -212,5 +212,42 @@ def register_schema(conn: sqlite3.Connection) -> None:
             size INTEGER NOT NULL,
             mtime REAL NOT NULL,
             mirrored_at TEXT NOT NULL
+        )
+    """)
+    # Scheduled entries (``orbit_jobs.schedules``). One row per run, kept 7 days
+    # (pruned by ``schedules.run_due``); the rows double as heartbeat data
+    # (``schedules.health``). ``status`` is running | ok | failed | skipped;
+    # ``job_id`` is set for an entry that runs as a job, whose outcome settles the row.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS schedule_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            period TEXT,
+            status TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            duration_ms INTEGER,
+            error TEXT,
+            job_id INTEGER
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_schedule_runs_name"
+        " ON schedule_runs (name, started_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_schedule_runs_started"
+        " ON schedule_runs (started_at)"
+    )
+    # Per-entry schedule state: the period the entry last claimed (claimed before
+    # its action runs, so a restart mid-run doesn't repeat it) and its failure
+    # backoff (consecutive failures, no retry before ``retry_at``).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS schedule_state (
+            name TEXT PRIMARY KEY,
+            period TEXT,
+            failures INTEGER NOT NULL DEFAULT 0,
+            retry_at TEXT,
+            updated_at TEXT
         )
     """)

@@ -15,7 +15,7 @@ package. It imports nothing from either. Both depend on it by git tag:
 dependencies = ["orbit-jobs[remote,server,mesh]"]
 
 [tool.uv.sources]
-orbit-jobs = { git = "https://github.com/vixtah/orbit-jobs", tag = "v0.1.0" }
+orbit-jobs = { git = "https://github.com/vixtah/orbit-jobs", tag = "v0.2.0" }
 ```
 
 ## Public API
@@ -54,9 +54,89 @@ job_id = spawn("double", {"n": 21})        # pending until a "cpu" worker claims
   `stop`. Pass it as the `transport` hook for instant worker wake-ups. Subjects are
   `<NATS_SUBJECT_PREFIX>.<tokens>` (default prefix `automations`, kept so processes
   of both repositories on one NATS server keep talking to each other).
+- `orbit_jobs.schedules` — declarative schedules for an app's tick, with failure
+  backoff and per-run records that double as heartbeats (below).
 - `orbit_jobs.schema.register_schema(conn)` — the `jobs`, `job_steps`,
-  `job_cancel_requests`, `worker_heartbeats` (and orphaned `remote_input_mirror`)
-  tables.
+  `job_cancel_requests`, `worker_heartbeats`, `schedule_runs`, `schedule_state` (and
+  orphaned `remote_input_mirror`) tables.
+
+## Schedules and health (`orbit_jobs.schedules`)
+
+"Run X every N minutes" for any app, standard library only; workers are optional.
+An `Entry(name, when, action)` runs on `Every(minutes)` (once per clock bucket),
+`Daily(at=(h, m), weekday=None, utc=False)` (once a day, or a week with `weekday`)
+or `TICK` (every tick). The action is `action(now)` (sync or async, on the event
+loop) or `Job(kind, payload)`, which spawns an orbit_jobs job and takes the run's
+outcome from the job; an entry whose job (scheduled or manual, same kind and
+subject) is still pending or running is not started again.
+
+```python
+from orbit_jobs.schedules import Backoff, Daily, Entry, Every, Job, health, run_due
+
+ENTRIES = (
+    Entry("refresh-planner", Every(5), plan_refreshes, title="Venue refresh planner",
+          kind="loop", where="VPS"),
+    Entry("news-ingest", Every(360), Job("pipeline_run", {"pipeline": "news-ingest"},
+          subject_type="pipeline", subject_id="news-ingest")),
+    Entry("morning-brief", Daily((9, 30)), spawn_brief, backoff=Backoff(15, 60)),
+)
+
+async def scheduler_loop():
+    while True:
+        await run_due(ENTRIES)          # each entry isolated; prunes old runs hourly
+        await asyncio.sleep(60)
+
+def heartbeats():                       # the services list of GET /heartbeats
+    return health(ENTRIES)
+```
+
+- **Claim before run.** A timed entry's period is written to `schedule_state` (a
+  compare-and-set, so two processes never both claim it) and a `running` row to
+  `schedule_runs` before the action starts. A restart mid-run doesn't repeat it;
+  the cut-off run is closed as `skipped` and the entry runs next period. An action
+  returns `RETRY` to leave the period unclaimed (no record) or `SKIP` to record a
+  `skipped` run. `enabled=` gates an entry without claiming anything.
+- **Backoff.** A failed run frees its period and waits `first_minutes` (60),
+  doubling per consecutive failure up to `max_minutes` (1440): 1, 2, 4, 8, 16, then
+  24 h. The wait is never shorter than the entry's interval (capped at
+  `max_minutes`, so a monthly entry retries daily rather than monthly). A success
+  resets it; the state is in the database, so it survives restarts. Override per
+  entry with `backoff=Backoff(first, max)`; `NO_BACKOFF` retries when next due. TICK
+  entries don't back off unless given one. A job that ends `cancelled` (e.g. a
+  restart's `cancel_orphans`) is recorded `skipped` and doesn't count as a failure.
+- **Run records.** `schedule_runs`: one row per run (`name`, `period`, `status`
+  running | ok | failed | skipped, `started_at`, `finished_at`, `duration_ms`,
+  `error` cut to 300 characters, `job_id`), kept 7 days (`run_due` prunes hourly;
+  `prune()` on demand).
+- **Health.** `health(entries, tick_minutes=1)` returns per entry `id`, `name`
+  (`title` or the name), `expected_every_minutes` (TICK reports `tick_minutes`),
+  `last_run_at`, `last_ok_at`, `last_status` (`unknown` before any run),
+  `last_error` (the latest failure's), `last_duration_ms`, `runs_24h`,
+  `failures_24h`, plus `kind` / `where` when the entry declares them: the service
+  shape of the `/heartbeats` contract (automations `docs/plans/HEARTBEATS.md`).
+  No payloads or results are included.
+
+### Migrating an existing scheduler
+
+Keep entry names and period formats: `Every.period` is
+`str(int(timestamp) // (60 * minutes))` and `Daily.period` is `YYYY-MM-DD`, the
+same as the automations registry (`server/schedule_registry.py`). Before the first
+`run_due`, import the periods once so nothing that already ran this period runs
+again: the automations host keeps them in the `scheduler_entry_periods`
+preference, so
+
+```python
+from orbit_jobs.schedules import import_periods
+import_periods(preferences.get("scheduler_entry_periods") or {})   # once; existing state wins
+```
+
+after which the preference is no longer read. Entries with `legacy_pref` should be
+folded into that dict first (as its `load_state` does). Note the behaviour change:
+a raising timed action used to be retried every tick; it now backs off (give a
+daily entry such as the morning brief `backoff=Backoff(15, 60)` to retry hourly the
+same day). Apps with their own run tables (Reserve's `runs`, CardScanner's
+`schedule:<name>` meta) can seed `schedule_state.period` the same way, or simply
+let each entry run once on the first tick.
 
 ## Hooks (`orbit_jobs.configure`)
 
