@@ -630,3 +630,132 @@ def test_works_with_only_the_standard_library(tmp_path):
                          capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "{'ping': 'ok'} ok"
+
+
+# ── error text: redaction, plain messages ─────────────────────────────
+
+
+def test_errors_are_redacted_by_default(clock):
+    def leaky(now):
+        raise RuntimeError("GET https://api.example.com/v1/slots?key=AIzaSECRET&date=1 failed;"
+                           " Authorization: Bearer abc.def.ghi token=hunter2")
+
+    entries = [Entry("leaky", Every(5), leaky)]
+    tick(entries, T0)
+    error = runs("leaky")[0]["error"]
+    assert error.startswith("RuntimeError: GET https://api.example.com/v1/slots failed;")
+    for secret in ("AIzaSECRET", "abc.def.ghi", "hunter2", "date=1"):
+        assert secret not in error
+    assert health(entries, T0)[0]["last_error"] == error
+
+
+def test_run_failed_records_the_plain_message(clock, caplog):
+    def fails(now):
+        raise schedules.RunFailed("3 of 40 venues failed: https://x.test/a?sig=zzz")
+
+    tick([Entry("plain", Every(5), fails)], T0)
+    assert runs("plain")[0]["error"] == "3 of 40 venues failed: https://x.test/a"
+    assert not any(r.exc_info for r in caplog.records if "plain" in r.getMessage())
+
+    class Wrapped(schedules.RunFailed):
+        pass
+
+    with pytest.raises(Wrapped), record_run("loop"):
+        raise Wrapped("no type prefix")
+    assert runs("loop")[0]["error"] == "no type prefix"
+
+
+def test_old_unredacted_records_are_redacted_when_reported(clock):
+    with get_db() as conn:
+        conn.execute("INSERT INTO schedule_runs (name, status, started_at, error)"
+                     " VALUES ('old', 'failed', ?, 'boom https://h.test/p?token=abc')",
+                     (schedules._iso(T0),))
+    assert health([Service("old", 5)], T0)[0]["last_error"] == "boom https://h.test/p"
+
+
+def test_the_redaction_hook_can_be_replaced(clock):
+    saved = config.snapshot()
+    try:
+        config.configure(redact_error=lambda text: text.replace("x", "?"))
+        with pytest.raises(RuntimeError), record_run("custom"):
+            raise RuntimeError("x https://h.test/?token=1")
+        assert runs("custom")[0]["error"] == "RuntimeError: ? https://h.test/?token=1"
+
+        def broken(text):
+            raise ValueError("bad hook")
+
+        config.configure(redact_error=broken)
+        with pytest.raises(RuntimeError), record_run("broken"):
+            raise RuntimeError("secret")
+        assert runs("broken")[0]["error"] == "[error text withheld: redaction failed]"
+    finally:
+        config.restore(saved)
+
+
+# ── importing past runs ───────────────────────────────────────────────
+
+
+def test_import_runs_gives_health_history_from_day_one(clock):
+    from orbit_jobs.schedules import import_runs
+
+    entries = [Entry("warm", Every(15), Counter())]
+    past = [
+        {"name": "warm", "started_at": (T0 - timedelta(hours=2)).timestamp(),
+         "finished_at": (T0 - timedelta(hours=2) + timedelta(seconds=90)).timestamp(),
+         "status": "ok"},
+        {"name": "warm", "started_at": (T0 - timedelta(hours=1)).isoformat(),
+         "finished_at": None, "status": "failed",
+         "error": "RefreshFailed: https://h.test/x?key=SECRET", "duration_ms": 5},
+        {"name": "warm", "started_at": datetime(2026, 10, 13, 9, 30), "status": "running"},
+        {"name": "warm", "started_at": T0 - timedelta(days=20), "status": "ok"},
+    ]
+    # The 20-day-old success goes at once (a newer one exists), as prune would.
+    assert import_runs(past, now=T0) == 3
+    assert import_runs(past, now=T0) == 0  # idempotent
+    item = health(entries, T0)[0]
+    assert item["last_ok_at"] == schedules._iso(T0 - timedelta(hours=2) + timedelta(seconds=90))
+    assert item["last_status"] == "skipped"
+    assert item["last_run_at"] == schedules._iso(datetime(2026, 10, 13, 9, 30, tzinfo=timezone.utc))
+    assert item["last_error"] == "RefreshFailed: https://h.test/x"
+    assert item["runs_24h"] == 3 and item["failures_24h"] == 1
+    assert [r["duration_ms"] for r in runs("warm")][:2] == [90000, 5]
+    assert len(runs("warm")) == 3
+
+
+def test_imported_runs_sort_by_time_not_by_insertion(clock):
+    from orbit_jobs.schedules import import_runs
+
+    entries = [Entry("warm", Every(15), Counter())]
+    tick(entries, T0)  # a new run first, then the older history
+    import_runs([{"name": "warm", "started_at": T0 - timedelta(hours=1), "status": "failed",
+                  "error": "old"}], now=T0)
+    item = health(entries, T0)[0]
+    assert item["last_status"] == "ok" and item["last_run_at"] == schedules._iso(T0)
+    assert item["last_error"] == "old" and item["runs_24h"] == 2
+
+
+def test_import_runs_rejects_unreadable_runs(clock):
+    from orbit_jobs.schedules import import_runs
+
+    for bad in ({"started_at": T0, "status": "ok"},
+                {"name": "x", "started_at": T0, "status": "done"},
+                {"name": "x", "status": "ok"},
+                {"name": "x", "started_at": "yesterday", "status": "ok"}):
+        with pytest.raises(ValueError):
+            import_runs([bad])
+    assert runs("x") == []
+
+
+def test_prune_keeps_the_latest_run_and_success_of_each_name(clock):
+    from orbit_jobs.schedules import import_runs
+
+    import_runs([
+        {"name": "monthly", "started_at": T0 - timedelta(days=40), "status": "ok"},
+        {"name": "monthly", "started_at": T0 - timedelta(days=30), "status": "ok"},
+        {"name": "monthly", "started_at": T0 - timedelta(days=10), "status": "failed"},
+        {"name": "monthly", "started_at": T0 - timedelta(days=9), "status": "failed"},
+    ], now=T0 - timedelta(days=50))
+    prune(T0)
+    assert [(r["started_at"][:10], r["status"]) for r in runs("monthly")] == [
+        ("2026-09-13", "ok"), ("2026-10-04", "failed")]
+    assert health([Service("monthly", 43200)], T0)[0]["last_ok_at"].startswith("2026-09-13")

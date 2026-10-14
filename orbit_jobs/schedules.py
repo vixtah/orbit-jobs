@@ -32,6 +32,11 @@ writes the same ``schedule_runs`` records (no periods, no backoff). Work that ru
 only when asked (a cache refresh on a request) is a ``Service`` with
 ``expected_every_minutes=None``: on demand, never late, only failures matter.
 
+Run errors are redacted before they are stored and when reported (the
+``redact_error`` hook, :mod:`orbit_jobs.redact`); raise :class:`RunFailed` to record a
+plain message without the exception type. :func:`import_runs` brings an app's past
+run records over when it switches from its own.
+
 :func:`health` reports per-entry (and per-service) heartbeat data
 (``docs/plans/HEARTBEATS.md`` in the automations repository). Needs only the standard library and the job tables
 (``orbit_jobs.schema``); no worker is required unless a :class:`Job` entry's kind
@@ -44,11 +49,12 @@ import asyncio
 import inspect
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from orbit_jobs.config import settings
 from orbit_jobs.db import get_db, now_iso
 from orbit_jobs.runner import JobConflictError, spawn
 from orbit_jobs.store import TERMINAL_STATUSES, has_active_for_subject
@@ -56,8 +62,8 @@ from orbit_jobs.store import get as get_job
 
 __all__ = [
     "Daily", "Every", "TICK", "Entry", "Service", "Job", "Backoff", "DEFAULT_BACKOFF", "NO_BACKOFF",
-    "RETRY", "SKIP", "FROM_WHEN", "MONDAY", "SATURDAY", "SUNDAY", "KEEP_DAYS", "ERROR_CHARS",
-    "run_due", "record_run", "health", "prune", "import_periods",
+    "RETRY", "SKIP", "RunFailed", "FROM_WHEN", "MONDAY", "SATURDAY", "SUNDAY", "KEEP_DAYS", "ERROR_CHARS",
+    "run_due", "record_run", "health", "prune", "import_periods", "import_runs",
 ]
 
 logger = logging.getLogger(__name__)
@@ -66,6 +72,15 @@ logger = logging.getLogger(__name__)
 RETRY = object()
 #: An action returns this to record a ``skipped`` run (its period stays claimed).
 SKIP = object()
+
+
+
+class RunFailed(Exception):
+    """Raise it (or a subclass) from an action or a :func:`record_run` block to record
+    a failed run whose error is exactly its message, without the exception type in
+    front (``RunFailed("3 of 40 venues failed")``). Other exceptions are recorded as
+    ``Type: message``. Either way the text is redacted (the ``redact_error`` hook)."""
+
 
 MONDAY, SATURDAY, SUNDAY = 0, 5, 6
 KEEP_DAYS = 7
@@ -242,7 +257,21 @@ def _now() -> datetime:
 
 
 def _error_text(exc: BaseException) -> str:
-    return f"{type(exc).__name__}: {exc}"[:ERROR_CHARS]
+    if isinstance(exc, RunFailed):
+        return _clean(str(exc)) or type(exc).__name__
+    return _clean(f"{type(exc).__name__}: {exc}")
+
+
+def _clean(error: str | None) -> str | None:
+    """Error text as stored and reported: redacted, then cut to ``ERROR_CHARS``."""
+    if not error:
+        return None
+    try:
+        error = settings.redact_error(str(error))
+    except Exception:  # a broken hook never leaks the raw text
+        logger.warning("the redact_error hook failed; withholding the error text", exc_info=True)
+        return "[error text withheld: redaction failed]"
+    return error[:ERROR_CHARS] if error else None
 
 
 # ── state + run records ───────────────────────────────────────────────
@@ -307,7 +336,7 @@ def _finish(entry: Entry, run_id: int, status: str, *, finished: datetime,
             duration_ms: int | None, error: str | None) -> None:
     """Close a run and update the entry's backoff: a failure releases the period and
     sets ``retry_at``; a success resets the failure count; a skip changes neither."""
-    error = error[:ERROR_CHARS] if error else None
+    error = _clean(error)
     ts = _iso(finished)
     with get_db() as conn:
         run = conn.execute("SELECT period FROM schedule_runs WHERE id = ?", (run_id,)).fetchone()
@@ -419,7 +448,10 @@ async def _run_entry(entry: Entry, tick: datetime, at: datetime) -> str | None:
     try:
         result = await _call(entry.action, tick)
     except Exception as exc:
-        logger.exception("scheduled entry %s failed; continuing", entry.name)
+        if isinstance(exc, RunFailed):
+            logger.warning("scheduled entry %s failed: %s", entry.name, _error_text(exc))
+        else:
+            logger.exception("scheduled entry %s failed; continuing", entry.name)
         ms = elapsed_ms()
         await asyncio.to_thread(_finish, entry, run_id, "failed", duration_ms=ms,
                                 finished=at + timedelta(milliseconds=ms), error=_error_text(exc))
@@ -488,6 +520,7 @@ def _close_run(run_id: int, started: float, exc: BaseException | None) -> None:
         status, error = "failed", _error_text(exc)
     else:  # cancelled or interrupted: not the loop's failure
         status, error = "skipped", _error_text(exc) if str(exc) else type(exc).__name__
+    error = _clean(error)
     ms = int((time.monotonic() - started) * 1000)
     finished = _now()
     with get_db() as conn:
@@ -568,10 +601,25 @@ class record_run:  # lower-case: used like a function, ``with record_run(name):`
 
 
 def prune(now: datetime | None = None, keep_days: int = KEEP_DAYS) -> int:
-    """Delete run records started more than ``keep_days`` ago; the count."""
-    cutoff = _iso((now or _now()) - timedelta(days=keep_days))
+    """Delete run records started more than ``keep_days`` ago, except each name's
+    latest run and latest success (so a monthly entry keeps its ``last_ok_at``); the
+    count."""
     with get_db() as conn:
-        return conn.execute("DELETE FROM schedule_runs WHERE started_at < ?", (cutoff,)).rowcount
+        return _prune(conn, now, keep_days)
+
+
+def _prune(conn: Any, now: datetime | None = None, keep_days: int = KEEP_DAYS) -> int:
+    cutoff = _iso((now or _now()) - timedelta(days=keep_days))
+    return conn.execute(
+        "DELETE FROM schedule_runs WHERE started_at < ? AND id NOT IN ("
+        " SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY name"
+        "  ORDER BY started_at DESC, id DESC) AS n FROM schedule_runs) WHERE n = 1"
+        " UNION"
+        " SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY name"
+        "  ORDER BY finished_at DESC, id DESC) AS n FROM schedule_runs"
+        "  WHERE status = 'ok') WHERE n = 1)",
+        (cutoff,),
+    ).rowcount
 
 
 def import_periods(periods: dict[str, str], *, failures: dict[str, int] | None = None,
@@ -616,6 +664,82 @@ def import_periods(periods: dict[str, str], *, failures: dict[str, int] | None =
     return imported
 
 
+_IMPORT_STATUSES = ("ok", "failed", "skipped")
+
+
+def _when(value: datetime | str | float | int | None, what: str) -> datetime | None:
+    """A run time given as a datetime (naive = UTC), ISO text or epoch seconds."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return datetime.fromtimestamp(value, timezone.utc)
+    parsed = _parse(str(value))
+    if parsed is None:
+        raise ValueError(f"import_runs: unreadable {what}: {value!r}")
+    return parsed
+
+
+def import_runs(runs: Iterable[Mapping[str, Any]], *, now: datetime | None = None) -> int:
+    """One-time import of an app's past run records into ``schedule_runs``, so an app
+    switching from its own records keeps its history: :func:`health` has ``last_ok_at``,
+    the last error and the 24-hour counts from the first moment, instead of a running
+    first run with no success yet.
+
+    Each run is a mapping with ``name``, ``started_at`` and ``status`` (``ok``,
+    ``failed`` or ``skipped``; ``running``, a run its process never finished, is
+    recorded ``skipped`` as interrupted) and optionally ``finished_at``, ``error`` and
+    ``duration_ms`` (computed from the two times when missing). Times are datetimes (a
+    naive one is UTC), ISO text or epoch seconds. Errors are redacted and cut like
+    any other run's.
+
+    Idempotent: a run whose name and start time (to the second) are already recorded
+    is skipped, so it is safe to call on every start. Records older than ``KEEP_DAYS``
+    are pruned as usual, except each name's latest run and latest success. Returns how
+    many runs were added."""
+    rows = []
+    for run in runs:
+        name = run.get("name")
+        if not name:
+            raise ValueError(f"import_runs: a run without a name: {dict(run)!r}")
+        status = str(run.get("status") or "")
+        error = run.get("error")
+        if status == "running":
+            status, error = "skipped", error or "interrupted (the process stopped mid-run)"
+        if status not in _IMPORT_STATUSES:
+            raise ValueError(f"import_runs: unknown status {status!r} for {name!r}")
+        started = _when(run.get("started_at"), "started_at")
+        if started is None:
+            raise ValueError(f"import_runs: a run of {name!r} without started_at")
+        finished = _when(run.get("finished_at"), "finished_at")
+        duration = run.get("duration_ms")
+        if duration is None and finished is not None:
+            duration = max(0, int((finished - started).total_seconds() * 1000))
+        if finished is None:  # every imported run is over: it ended when it started
+            finished = started + timedelta(milliseconds=int(duration or 0))
+        rows.append((str(name), status, _iso(started),
+                     _iso(finished), int(duration) if duration is not None else None, _clean(error)))
+    added: list[int] = []
+    with get_db() as conn:
+        for name, status, started, finished, duration, error in rows:
+            if conn.execute("SELECT 1 FROM schedule_runs WHERE name = ? AND started_at = ?",
+                            (name, started)).fetchone():
+                continue
+            added.append(int(conn.execute(
+                "INSERT INTO schedule_runs (name, status, started_at, finished_at,"
+                " duration_ms, error) VALUES (?, ?, ?, ?, ?, ?)",
+                (name, status, started, finished, duration, error),
+            ).lastrowid))
+        if not added:
+            return 0
+        # What prune would delete goes now, so a repeat import adds nothing again.
+        _prune(conn, now)
+        marks = ",".join("?" * len(added))
+        return conn.execute(f"SELECT COUNT(*) FROM schedule_runs WHERE id IN ({marks})",
+                            added).fetchone()[0]
+
+
 def _expected_every(entry: Entry | Service, tick_minutes: float) -> float | None:
     if isinstance(entry, Service) or entry.expected_every_minutes is not FROM_WHEN:
         return entry.expected_every_minutes
@@ -639,12 +763,12 @@ def health(entries: tuple[Entry | Service, ...] | list[Entry | Service],
                 return conn.execute(sql, (name, *args)).fetchone()
 
             last = q("SELECT started_at, status FROM schedule_runs WHERE name = ?"
-                     " ORDER BY id DESC LIMIT 1")
+                     " ORDER BY started_at DESC, id DESC LIMIT 1")
             ok = q("SELECT MAX(finished_at) AS at FROM schedule_runs WHERE name = ? AND status = 'ok'")
             failed = q("SELECT error FROM schedule_runs WHERE name = ? AND status = 'failed'"
-                       " ORDER BY id DESC LIMIT 1")
+                       " ORDER BY started_at DESC, id DESC LIMIT 1")
             done = q("SELECT duration_ms FROM schedule_runs WHERE name = ?"
-                     " AND status != 'running' ORDER BY id DESC LIMIT 1")
+                     " AND status != 'running' ORDER BY started_at DESC, id DESC LIMIT 1")
             counts = q("SELECT COUNT(*) AS runs, COALESCE(SUM(status = 'failed'), 0) AS failures"
                        " FROM schedule_runs WHERE name = ? AND started_at >= ?", since)
             item = {
@@ -654,7 +778,7 @@ def health(entries: tuple[Entry | Service, ...] | list[Entry | Service],
                 "last_run_at": last["started_at"] if last else None,
                 "last_ok_at": ok["at"] if ok else None,
                 "last_status": last["status"] if last else "unknown",
-                "last_error": failed["error"] if failed else None,
+                "last_error": _clean(failed["error"]) if failed else None,
                 "last_duration_ms": done["duration_ms"] if done else None,
                 "runs_24h": counts["runs"],
                 "failures_24h": counts["failures"],

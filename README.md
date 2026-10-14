@@ -15,7 +15,7 @@ package. It imports nothing from either. Both depend on it by git tag:
 dependencies = ["orbit-jobs[remote,server,mesh]"]
 
 [tool.uv.sources]
-orbit-jobs = { git = "https://github.com/vixtah/orbit-jobs", tag = "v0.2.3" }
+orbit-jobs = { git = "https://github.com/vixtah/orbit-jobs", tag = "v0.2.4" }
 ```
 
 ## Public API
@@ -109,7 +109,18 @@ def heartbeats():                       # the services list of GET /heartbeats
 - **Run records.** `schedule_runs`: one row per run (`name`, `period`, `status`
   running | ok | failed | skipped, `started_at`, `finished_at`, `duration_ms`,
   `error` cut to 300 characters, `job_id`), kept 7 days (`run_due` prunes hourly;
-  `prune()` on demand).
+  `prune()` on demand), except each name's latest run and latest success, so a
+  monthly entry keeps its `last_ok_at`.
+- **Error text.** A failure is recorded as `Type: message`; raise
+  `RunFailed("3 of 40 venues failed")` (or a subclass) from an action or a
+  `record_run` block to record just the message. Every error is redacted before it
+  is stored and again when `health()` reports it (`orbit_jobs.redact.redact`): URL
+  query strings, fragments and `user:password@` are removed, and `Bearer` / `Basic`
+  credentials, the value after a secret-looking name (`token`, `x-app-token`,
+  `api_key`, `client_secret`, `password`, `authorization`, `cookie`, `session`...)
+  and long opaque strings (32+ characters mixing letters and digits) become
+  `[redacted]`. The `redact_error` hook replaces the rule (a stricter one, or
+  `lambda text: text`); a hook that raises withholds the text.
 - **Health.** `health(entries, tick_minutes=1)` (entries and/or `Service`s, below)
   returns per item `id`, `name` (`title` or the name), `expected_every_minutes`
   (TICK reports `tick_minutes`, a service its declared value; an entry may declare
@@ -185,6 +196,25 @@ doubling; give the morning brief `backoff=Backoff(15, 60)` to retry sooner). App
 `schedule:<name>` meta) can seed `schedule_state.period` the same way, or simply
 let each entry run once on the first tick.
 
+Bring the old run history too, or `health()` starts empty: the first run shows as
+`running` with no success yet, which a heartbeat collector reads as late.
+`import_runs(runs)` takes the past runs as mappings with `name`, `started_at`,
+`status` (ok | failed | skipped; `running`, a run whose process stopped, becomes
+`skipped`) and optionally `finished_at`, `error` and `duration_ms`; times are
+datetimes (naive = UTC), ISO text or epoch seconds:
+
+```python
+from orbit_jobs.schedules import import_runs
+import_runs({"name": r["service"], "started_at": r["started_at"], "finished_at": r["finished_at"],
+             "status": r["status"], "error": r["error"]} for r in old_rows)   # every start is fine
+```
+
+It is idempotent (a run with the same name and start second is skipped), redacts
+errors like any run, and keeps only what pruning would keep (the last 7 days, plus
+each name's latest run and latest success), so `last_ok_at`, `last_error` and the
+24-hour counts are right from the first request. `health()` orders runs by start
+time, so history imported after new runs doesn't hide them.
+
 ## Hooks (`orbit_jobs.configure`)
 
 A composition root sets these once, before importing `orbit_jobs.worker` (which
@@ -198,6 +228,7 @@ records its code version on import). Every hook has a self-contained default.
 | `on_job_finished(job_id=, kind=, status=, error=)` | nothing | activity feed (`core.events.feed`) |
 | `reap_children()` | nothing | `kill_child_process_tree` (Playwright) |
 | `pause_claiming(capabilities)` | never | ollama workers pause while voice is busy |
+| `redact_error(text)` | `orbit_jobs.redact.redact` | (default) |
 | `on_worker_start(capabilities)` | nothing | `core.logsink.install` |
 | `host_name(hostname)`, `excluded_cpus(host)` | short hostname, none | `core.compute_allocation` |
 | `on_lease(job, worker_id)`, `on_lease_end(job, worker_id)` | nothing | hold/release a machine's CPUs for `remote-gpu` jobs |

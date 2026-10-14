@@ -27,6 +27,10 @@ Hooks:
 - ``code_root`` / ``code_dirs`` — the checkout whose commit (plus an mtime
   digest of ``code_dirs``) is the code version; None means the working directory.
   Set before importing ``orbit_jobs.worker``, which records its startup version.
+- ``redact_error(text) -> str`` — applied to every schedule run error before it is
+  stored or reported (:mod:`orbit_jobs.schedules`). Default:
+  :func:`orbit_jobs.redact.redact` (URL query strings, credentials and token-like
+  values removed); a host may pass a stricter one, or ``lambda text: text``.
 - ``import_probe`` — module a fresh interpreter must import before a worker
   execs itself (None: no probe). ``worker_module`` — what the exec re-runs
   (``AUTOMATIONS_WORKER_MODULE`` overrides).
@@ -93,6 +97,12 @@ def _default_make_bus(name: str, *, queue_size: int = 256):
     return Bus(name, queue_size=queue_size)
 
 
+def _default_redact_error(text: str) -> str:
+    from orbit_jobs.redact import redact
+
+    return redact(text)
+
+
 def _short_host_name(host: str) -> str:
     return host.strip().split(".")[0]
 
@@ -118,6 +128,7 @@ class Settings:
     code_root: Path | None = None
     code_dirs: tuple[str, ...] = ()
     import_probe: str | None = None
+    redact_error: Callable[[str], str] = _default_redact_error
     worker_module: str = "orbit_jobs.worker"
 
 
