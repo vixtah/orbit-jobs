@@ -108,13 +108,46 @@ def heartbeats():                       # the services list of GET /heartbeats
   running | ok | failed | skipped, `started_at`, `finished_at`, `duration_ms`,
   `error` cut to 300 characters, `job_id`), kept 7 days (`run_due` prunes hourly;
   `prune()` on demand).
-- **Health.** `health(entries, tick_minutes=1)` returns per entry `id`, `name`
-  (`title` or the name), `expected_every_minutes` (TICK reports `tick_minutes`),
-  `last_run_at`, `last_ok_at`, `last_status` (`unknown` before any run),
-  `last_error` (the latest failure's), `last_duration_ms`, `runs_24h`,
-  `failures_24h`, plus `kind` / `where` when the entry declares them: the service
+- **Health.** `health(entries, tick_minutes=1)` (entries and/or `Service`s, below)
+  returns per item `id`, `name` (`title` or the name), `expected_every_minutes`
+  (TICK reports `tick_minutes`, a service its declared value), `last_run_at`,
+  `last_ok_at`, `last_status` (`unknown` before any run), `last_error` (the latest
+  failure's), `last_duration_ms`, `runs_24h`, `failures_24h`, plus `kind` / `where` when the entry declares them: the service
   shape of the `/heartbeats` contract (automations `docs/plans/HEARTBEATS.md`).
   No payloads or results are included.
+
+### Hand-written loops (`Service`, `record_run`)
+
+A loop that doesn't go through `run_due` (a `while True` sweeper, an always-on
+worker) declares a `Service` and wraps each iteration in `record_run`. Its runs
+land in the same `schedule_runs` table and `health()` takes entries and services
+together:
+
+```python
+from orbit_jobs.schedules import Service, health, record_run
+
+SWEEPER = Service("fleet-sweeper", expected_every_minutes=2, title="Fleet sweeper",
+                  kind="loop", where="VPS")
+
+async def sweeper_loop():
+    while True:
+        try:
+            async with record_run(SWEEPER):     # or `with record_run("fleet-sweeper"):`
+                await sweep_fleet()
+        except Exception:
+            log.exception("sweep failed")       # already recorded as failed
+        await asyncio.sleep(120)
+
+def heartbeats():
+    return health([*ENTRIES, SWEEPER])
+```
+
+`record_run` writes a `running` row on entry, then `ok`, or `failed` with the
+error cut to 300 characters (the exception still propagates); a cancellation is
+recorded `skipped`. There are no periods or backoff: the loop keeps its own timing.
+One name runs one iteration at a time; a row still `running` when the next starts
+(the process stopped) is closed as `skipped`. Old records are pruned hourly, as
+with `run_due`.
 
 ### Migrating an existing scheduler
 

@@ -26,8 +26,12 @@ and never less than the entry's normal interval (itself capped at
 ``max_minutes``, so a monthly entry still retries daily). A success resets it.
 TICK entries don't back off unless given a ``backoff``.
 
-:func:`health` reports per-entry heartbeat data (``docs/plans/HEARTBEATS.md`` in
-the automations repository). Needs only the standard library and the job tables
+A hand-written loop that doesn't use the registry (``while True: ...; sleep``)
+declares a :class:`Service` and wraps each iteration in :func:`record_run`, which
+writes the same ``schedule_runs`` records (no periods, no backoff).
+
+:func:`health` reports per-entry (and per-service) heartbeat data
+(``docs/plans/HEARTBEATS.md`` in the automations repository). Needs only the standard library and the job tables
 (``orbit_jobs.schema``); no worker is required unless a :class:`Job` entry's kind
 is capability-routed.
 """
@@ -49,9 +53,9 @@ from orbit_jobs.store import TERMINAL_STATUSES, has_active_for_subject
 from orbit_jobs.store import get as get_job
 
 __all__ = [
-    "Daily", "Every", "TICK", "Entry", "Job", "Backoff", "DEFAULT_BACKOFF", "NO_BACKOFF",
+    "Daily", "Every", "TICK", "Entry", "Service", "Job", "Backoff", "DEFAULT_BACKOFF", "NO_BACKOFF",
     "RETRY", "SKIP", "MONDAY", "SATURDAY", "SUNDAY", "KEEP_DAYS", "ERROR_CHARS",
-    "run_due", "health", "prune", "import_periods",
+    "run_due", "record_run", "health", "prune", "import_periods",
 ]
 
 logger = logging.getLogger(__name__)
@@ -178,6 +182,20 @@ class Entry:
         if self.backoff is not None:
             return self.backoff
         return DEFAULT_BACKOFF if self.when.stateful else NO_BACKOFF
+
+
+@dataclass(frozen=True)
+class Service:
+    """A hand-written loop or worker that records its own runs with
+    :func:`record_run` instead of being run by :func:`run_due`. ``name`` is its id in
+    ``schedule_runs``; ``expected_every_minutes`` is how often a run should happen.
+    ``title``, ``kind`` and ``where`` are descriptive only, as on :class:`Entry`."""
+
+    name: str
+    expected_every_minutes: float
+    title: str | None = None
+    kind: str | None = None
+    where: str | None = None
 
 
 # ── time helpers ──────────────────────────────────────────────────────
@@ -421,6 +439,93 @@ async def run_due(entries: tuple[Entry, ...] | list[Entry],
     return out
 
 
+# ── hand-written loops ────────────────────────────────────────────────
+
+
+def _open_run(name: str) -> int:
+    """Insert a ``running`` row (closing one left by a stopped process); its id."""
+    ts = _iso(_now())
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE schedule_runs SET status = 'skipped', finished_at = ?,"
+            " error = 'interrupted (the process stopped mid-run)'"
+            " WHERE name = ? AND status = 'running' AND job_id IS NULL",
+            (ts, name),
+        )
+        cur = conn.execute(
+            "INSERT INTO schedule_runs (name, status, started_at) VALUES (?, 'running', ?)",
+            (name, ts),
+        )
+        return int(cur.lastrowid)
+
+
+def _close_run(run_id: int, started: float, exc: BaseException | None) -> None:
+    if exc is None:
+        status, error = "ok", None
+    elif isinstance(exc, Exception):
+        status, error = "failed", _error_text(exc)
+    else:  # cancelled or interrupted: not the loop's failure
+        status, error = "skipped", _error_text(exc) if str(exc) else type(exc).__name__
+    ms = int((time.monotonic() - started) * 1000)
+    finished = _now()
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE schedule_runs SET status = ?, finished_at = ?, duration_ms = ?, error = ?"
+            " WHERE id = ?",
+            (status, _iso(finished), ms, error, run_id),
+        )
+    global _last_prune
+    if _last_prune is None or not timedelta(0) <= finished - _last_prune < _PRUNE_EVERY:
+        try:
+            prune(finished)
+            _last_prune = finished
+        except Exception:
+            logger.exception("pruning schedule runs failed")
+
+
+class record_run:  # lower-case: used like a function, ``with record_run(name):``
+    """Record one run of a hand-written loop in ``schedule_runs``, so it shows in
+    :func:`health` like an entry: ``running`` on entry, then ``ok``, or ``failed``
+    with the error (cut to 300 characters) when the block raises; the exception still
+    propagates. A cancellation (``CancelledError``, ``KeyboardInterrupt``) is recorded
+    ``skipped``. Works as ``with`` and ``async with`` (the async form does its
+    database writes off the event loop). ``service`` is a :class:`Service` or its
+    name. One name runs one iteration at a time: a row still ``running`` when the
+    next starts is closed as ``skipped`` (interrupted). Old records are pruned at most
+    hourly, as :func:`run_due` does."""
+
+    def __init__(self, service: Service | str):
+        self.name = service.name if isinstance(service, Service) else service
+        self._run_id: int | None = None
+        self._started = 0.0
+
+    def __enter__(self) -> record_run:
+        self._run_id = _open_run(self.name)
+        self._started = time.monotonic()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._run_id is None:
+            return
+        try:  # a recording failure never masks the block's own outcome
+            _close_run(self._run_id, self._started, exc)
+        except Exception:
+            logger.exception("recording the end of %s failed", self.name)
+
+    async def __aenter__(self) -> record_run:
+        self._run_id = await asyncio.to_thread(_open_run, self.name)
+        self._started = time.monotonic()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self._run_id is None:
+            return
+        try:
+            await asyncio.to_thread(_close_run, self._run_id, self._started, exc)
+        except Exception:
+            logger.exception("recording the end of %s failed", self.name)
+
+
 # ── maintenance + read side ──────────────────────────────────────────
 
 
@@ -447,10 +552,11 @@ def import_periods(periods: dict[str, str]) -> int:
         )
 
 
-def health(entries: tuple[Entry, ...] | list[Entry], now: datetime | None = None, *,
-           tick_minutes: float = 1) -> list[dict[str, Any]]:
-    """Per-entry heartbeat data: ``id``, ``name``, ``expected_every_minutes`` (TICK
-    entries report ``tick_minutes``), ``last_run_at``, ``last_ok_at``, ``last_status``
+def health(entries: tuple[Entry | Service, ...] | list[Entry | Service],
+           now: datetime | None = None, *, tick_minutes: float = 1) -> list[dict[str, Any]]:
+    """Per-entry heartbeat data for :class:`Entry` and :class:`Service` items, in
+    order: ``id``, ``name``, ``expected_every_minutes`` (TICK entries report
+    ``tick_minutes``; a service its own), ``last_run_at``, ``last_ok_at``, ``last_status``
     (ok | failed | skipped | running | unknown), ``last_error``, ``last_duration_ms``,
     ``runs_24h``, ``failures_24h``, plus ``kind`` / ``where`` when the entry declares
     them. Never includes payloads."""
@@ -473,7 +579,9 @@ def health(entries: tuple[Entry, ...] | list[Entry], now: datetime | None = None
             item = {
                 "id": entry.name,
                 "name": entry.title or entry.name,
-                "expected_every_minutes": entry.when.interval_minutes or tick_minutes,
+                "expected_every_minutes": (
+                    entry.expected_every_minutes if isinstance(entry, Service)
+                    else entry.when.interval_minutes or tick_minutes),
                 "last_run_at": last["started_at"] if last else None,
                 "last_ok_at": ok["at"] if ok else None,
                 "last_status": last["status"] if last else "unknown",

@@ -20,9 +20,11 @@ from orbit_jobs.schedules import (
     Entry,
     Every,
     Job,
+    Service,
     health,
     import_periods,
     prune,
+    record_run,
     run_due,
 )
 
@@ -402,6 +404,80 @@ def test_health_shape_and_24h_counts(clock):
     }
     assert sweep["expected_every_minutes"] == 1 and sweep["runs_24h"] == 4
     assert health(entries[2:], now, tick_minutes=0.5)[0]["expected_every_minutes"] == 0.5
+
+
+# ── hand-written loops (Service + record_run) ─────────────────────────
+
+
+def test_record_run_records_ok_and_failed_runs(clock):
+    sweeper = Service("fleet-sweeper", 2, title="Fleet sweeper", kind="loop", where="VPS")
+    with record_run(sweeper):
+        assert runs("fleet-sweeper")[-1]["status"] == "running"
+        clock.advance(seconds=3)
+    clock.advance(minutes=2)
+    with pytest.raises(RuntimeError), record_run("fleet-sweeper"):
+        raise RuntimeError("droplet API 503 " + "x" * 400)
+
+    ok, failed = runs("fleet-sweeper")
+    assert ok["status"] == "ok" and ok["error"] is None and ok["period"] is None
+    assert ok["started_at"] == schedules._iso(T0)
+    assert ok["finished_at"] == schedules._iso(T0 + timedelta(seconds=3))
+    assert failed["status"] == "failed" and len(failed["error"]) == 300
+    assert failed["error"].startswith("RuntimeError: droplet API 503")
+    assert state("fleet-sweeper") is None  # no period, no backoff
+
+
+def test_record_run_async_and_cancellation(clock):
+    async def main():
+        async with record_run("lab"):
+            await asyncio.sleep(0)
+        with pytest.raises(asyncio.CancelledError):
+            async with record_run("lab"):
+                raise asyncio.CancelledError()
+        with pytest.raises(ValueError):
+            async with record_run("lab"):
+                raise ValueError("bad shard")
+
+    asyncio.run(main())
+    assert [(r["status"], r["error"]) for r in runs("lab")] == [
+        ("ok", None), ("skipped", "CancelledError"), ("failed", "ValueError: bad shard")]
+
+
+def test_record_run_closes_a_run_cut_off_by_a_stopped_process(clock):
+    record_run("sweeper").__enter__()  # the process died inside the block
+    clock.advance(minutes=1)
+    with record_run("sweeper"):
+        pass
+    assert [(r["status"], r["error"]) for r in runs("sweeper")] == [
+        ("skipped", "interrupted (the process stopped mid-run)"), ("ok", None)]
+
+
+def test_health_mixes_entries_and_services(clock):
+    entries = [Entry("planner", Every(5), Counter())]
+    sweeper = Service("fleet-sweeper", 2, title="Fleet sweeper", kind="loop", where="VPS")
+    tick(entries, T0)
+    with pytest.raises(RuntimeError), record_run(sweeper):
+        raise RuntimeError("boom")
+    planner, svc, idle = health([*entries, sweeper, Service("idle", 60)], T0)
+
+    assert planner["id"] == "planner" and planner["last_status"] == "ok"
+    assert svc == {
+        "id": "fleet-sweeper", "name": "Fleet sweeper", "expected_every_minutes": 2,
+        "last_run_at": schedules._iso(T0), "last_ok_at": None, "last_status": "failed",
+        "last_error": "RuntimeError: boom", "last_duration_ms": svc["last_duration_ms"],
+        "runs_24h": 1, "failures_24h": 1, "kind": "loop", "where": "VPS",
+    }
+    assert idle["last_status"] == "unknown" and idle["expected_every_minutes"] == 60
+    assert "kind" not in idle
+
+
+def test_record_run_prunes_old_records(clock):
+    with record_run("x"):
+        pass
+    clock.advance(days=8)
+    with record_run("x"):
+        pass
+    assert [r["started_at"][:10] for r in runs("x")] == ["2026-10-21"]
 
 
 def test_old_runs_are_pruned_automatically(clock):
