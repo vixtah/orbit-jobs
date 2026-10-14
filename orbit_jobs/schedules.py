@@ -21,14 +21,16 @@ An action returns :data:`RETRY` to leave its period unclaimed (try again next ti
 nothing recorded) or :data:`SKIP` to record a ``skipped`` run.
 
 A failed run releases its period and backs off (:class:`Backoff`): the next try
-waits ``first_minutes`` doubling per consecutive failure up to ``max_minutes``,
-and never less than the entry's normal interval (itself capped at
-``max_minutes``, so a monthly entry still retries daily). A success resets it.
-TICK entries don't back off unless given a ``backoff``.
+waits ``first_minutes`` (60) doubling per consecutive failure up to ``max_minutes``
+(a day), whatever the entry's interval: a 6-hourly entry retries after 1 h, a
+monthly one within a day. A success resets it. TICK entries don't back off unless
+given a ``backoff``.
 
 A hand-written loop that doesn't use the registry (``while True: ...; sleep``)
 declares a :class:`Service` and wraps each iteration in :func:`record_run`, which
-writes the same ``schedule_runs`` records (no periods, no backoff).
+writes the same ``schedule_runs`` records (no periods, no backoff). Work that runs
+only when asked (a cache refresh on a request) is a ``Service`` with
+``expected_every_minutes=None``: on demand, never late, only failures matter.
 
 :func:`health` reports per-entry (and per-service) heartbeat data
 (``docs/plans/HEARTBEATS.md`` in the automations repository). Needs only the standard library and the job tables
@@ -54,7 +56,7 @@ from orbit_jobs.store import get as get_job
 
 __all__ = [
     "Daily", "Every", "TICK", "Entry", "Service", "Job", "Backoff", "DEFAULT_BACKOFF", "NO_BACKOFF",
-    "RETRY", "SKIP", "MONDAY", "SATURDAY", "SUNDAY", "KEEP_DAYS", "ERROR_CHARS",
+    "RETRY", "SKIP", "FROM_WHEN", "MONDAY", "SATURDAY", "SUNDAY", "KEEP_DAYS", "ERROR_CHARS",
     "run_due", "record_run", "health", "prune", "import_periods",
 ]
 
@@ -128,20 +130,34 @@ TICK = _Tick()
 @dataclass(frozen=True)
 class Backoff:
     """After ``n`` consecutive failures, wait ``first_minutes * 2**(n-1)`` capped at
-    ``max_minutes``, and at least the entry's interval capped at ``max_minutes``."""
+    ``max_minutes``, regardless of the entry's interval. ``at_least_interval=True``
+    restores the v0.2.1 floor: never sooner than the interval (capped at
+    ``max_minutes``)."""
 
     first_minutes: float = 60
     max_minutes: float = 24 * 60
+    at_least_interval: bool = False
 
     def delay_minutes(self, failures: int, interval_minutes: float | None = None) -> float:
         grown = min(self.max_minutes, self.first_minutes * 2 ** min(max(failures, 1) - 1, 30))
-        floor = min(interval_minutes or 0, self.max_minutes)
-        return max(grown, floor)
+        if not self.at_least_interval:
+            return grown
+        return max(grown, min(interval_minutes or 0, self.max_minutes))
 
 
 DEFAULT_BACKOFF = Backoff()
 #: A failed run is retried as soon as it is next due.
 NO_BACKOFF = Backoff(first_minutes=0, max_minutes=0)
+
+
+class _FromWhen:
+    """The default of :attr:`Entry.expected_every_minutes`: take it from ``when``."""
+
+    def __repr__(self) -> str:
+        return "FROM_WHEN"
+
+
+FROM_WHEN = _FromWhen()
 
 
 @dataclass(frozen=True)
@@ -167,6 +183,9 @@ class Entry:
     claimed or recorded. ``backoff`` defaults to :data:`DEFAULT_BACKOFF` for timed
     entries and :data:`NO_BACKOFF` for TICK. ``title``, ``kind`` and ``where`` are
     descriptive only (heartbeat ``name`` / ``kind`` / ``where``).
+    ``expected_every_minutes`` overrides the cadence :func:`health` reports (by
+    default the ``when``'s interval, or the tick for TICK); ``None`` means on demand
+    (e.g. a TICK entry whose own gate rarely opens): never late, only failures matter.
     """
 
     name: str
@@ -177,6 +196,7 @@ class Entry:
     title: str | None = None
     kind: str | None = None
     where: str | None = None
+    expected_every_minutes: float | None | _FromWhen = FROM_WHEN
 
     def _backoff(self) -> Backoff:
         if self.backoff is not None:
@@ -188,11 +208,13 @@ class Entry:
 class Service:
     """A hand-written loop or worker that records its own runs with
     :func:`record_run` instead of being run by :func:`run_due`. ``name`` is its id in
-    ``schedule_runs``; ``expected_every_minutes`` is how often a run should happen.
-    ``title``, ``kind`` and ``where`` are descriptive only, as on :class:`Entry`."""
+    ``schedule_runs``; ``expected_every_minutes`` is how often a run should happen, or
+    ``None`` for work that runs only when asked (on demand: never late, only failures
+    matter). ``title``, ``kind`` and ``where`` are descriptive only, as on
+    :class:`Entry`."""
 
     name: str
-    expected_every_minutes: float
+    expected_every_minutes: float | None
     title: str | None = None
     kind: str | None = None
     where: str | None = None
@@ -536,27 +558,60 @@ def prune(now: datetime | None = None, keep_days: int = KEEP_DAYS) -> int:
         return conn.execute("DELETE FROM schedule_runs WHERE started_at < ?", (cutoff,)).rowcount
 
 
-def import_periods(periods: dict[str, str]) -> int:
-    """One-time import of an app's existing ``{entry name: period}`` (same formats as
-    :meth:`Daily.period` / :meth:`Every.period`), so nothing that already ran this
-    period runs again after the switch. Entries that already have state are left
-    alone. Returns how many were imported."""
+def import_periods(periods: dict[str, str], *, failures: dict[str, int] | None = None,
+                   retry_at: dict[str, datetime | str] | None = None) -> int:
+    """One-time import of an app's existing schedule state, so the switch from its own
+    scheduler neither repeats a run nor forgets a failure:
+
+    - ``periods``: ``{entry name: period}`` (same formats as :meth:`Daily.period` /
+      :meth:`Every.period`); nothing that already ran this period runs again.
+    - ``failures``: ``{entry name: consecutive failures}``; the next failure's backoff
+      grows from there.
+    - ``retry_at``: ``{entry name: datetime or ISO time}``; the entry doesn't run
+      before then (a naive time is UTC). Leave a retrying entry's period out (a failed
+      run releases its period), so it runs once ``retry_at`` passes.
+
+    A name may appear in any of the three. Entries that already have state are left
+    alone (existing state wins). Returns how many were imported."""
+    failures, retry_at = failures or {}, retry_at or {}
+    retries: dict[str, str] = {}
+    for name, when in retry_at.items():
+        if when is None or when == "":
+            continue
+        parsed = when if isinstance(when, datetime) else _parse(str(when))
+        if parsed is None:
+            raise ValueError(f"import_periods: unreadable retry_at for {name!r}: {when!r}")
+        retries[name] = _iso(parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc))
+    names = dict.fromkeys([*periods, *failures, *retries])
     ts = _iso(_now())
+    imported = 0
     with get_db() as conn:
-        return sum(
-            conn.execute(
-                "INSERT OR IGNORE INTO schedule_state (name, period, updated_at) VALUES (?, ?, ?)",
-                (name, str(period), ts),
+        for name in names:
+            period = str(periods[name]) if periods.get(name) else None
+            count = int(failures.get(name) or 0)
+            retry = retries.get(name)
+            if period is None and not count and retry is None:
+                continue
+            imported += conn.execute(
+                "INSERT OR IGNORE INTO schedule_state (name, period, failures, retry_at,"
+                " updated_at) VALUES (?, ?, ?, ?, ?)",
+                (name, period, count, retry, ts),
             ).rowcount
-            for name, period in periods.items() if period
-        )
+    return imported
+
+
+def _expected_every(entry: Entry | Service, tick_minutes: float) -> float | None:
+    if isinstance(entry, Service) or entry.expected_every_minutes is not FROM_WHEN:
+        return entry.expected_every_minutes
+    return entry.when.interval_minutes or tick_minutes
 
 
 def health(entries: tuple[Entry | Service, ...] | list[Entry | Service],
            now: datetime | None = None, *, tick_minutes: float = 1) -> list[dict[str, Any]]:
     """Per-entry heartbeat data for :class:`Entry` and :class:`Service` items, in
     order: ``id``, ``name``, ``expected_every_minutes`` (TICK entries report
-    ``tick_minutes``; a service its own), ``last_run_at``, ``last_ok_at``, ``last_status``
+    ``tick_minutes``; a service or an entry that declares one its own, ``None`` meaning
+    on demand), ``last_run_at``, ``last_ok_at``, ``last_status``
     (ok | failed | skipped | running | unknown), ``last_error``, ``last_duration_ms``,
     ``runs_24h``, ``failures_24h``, plus ``kind`` / ``where`` when the entry declares
     them. Never includes payloads."""
@@ -579,9 +634,7 @@ def health(entries: tuple[Entry | Service, ...] | list[Entry | Service],
             item = {
                 "id": entry.name,
                 "name": entry.title or entry.name,
-                "expected_every_minutes": (
-                    entry.expected_every_minutes if isinstance(entry, Service)
-                    else entry.when.interval_minutes or tick_minutes),
+                "expected_every_minutes": _expected_every(entry, tick_minutes),
                 "last_run_at": last["started_at"] if last else None,
                 "last_ok_at": ok["at"] if ok else None,
                 "last_status": last["status"] if last else "unknown",

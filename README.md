@@ -15,7 +15,7 @@ package. It imports nothing from either. Both depend on it by git tag:
 dependencies = ["orbit-jobs[remote,server,mesh]"]
 
 [tool.uv.sources]
-orbit-jobs = { git = "https://github.com/vixtah/orbit-jobs", tag = "v0.2.0" }
+orbit-jobs = { git = "https://github.com/vixtah/orbit-jobs", tag = "v0.2.2" }
 ```
 
 ## Public API
@@ -98,10 +98,12 @@ def heartbeats():                       # the services list of GET /heartbeats
   `skipped` run. `enabled=` gates an entry without claiming anything.
 - **Backoff.** A failed run frees its period and waits `first_minutes` (60),
   doubling per consecutive failure up to `max_minutes` (1440): 1, 2, 4, 8, 16, then
-  24 h. The wait is never shorter than the entry's interval (capped at
-  `max_minutes`, so a monthly entry retries daily rather than monthly). A success
-  resets it; the state is in the database, so it survives restarts. Override per
-  entry with `backoff=Backoff(first, max)`; `NO_BACKOFF` retries when next due. TICK
+  24 h, whatever the entry's interval (a 6-hourly entry retries after 1 h, a daily
+  or monthly one within the day). A success resets it; the state is in the
+  database, so it survives restarts. Override per entry with
+  `backoff=Backoff(first, max)`; `Backoff(at_least_interval=True)` keeps the v0.2.1
+  rule (never sooner than the interval, capped at `max_minutes`); `NO_BACKOFF`
+  retries when next due. TICK
   entries don't back off unless given one. A job that ends `cancelled` (e.g. a
   restart's `cancel_orphans`) is recorded `skipped` and doesn't count as a failure.
 - **Run records.** `schedule_runs`: one row per run (`name`, `period`, `status`
@@ -110,7 +112,8 @@ def heartbeats():                       # the services list of GET /heartbeats
   `prune()` on demand).
 - **Health.** `health(entries, tick_minutes=1)` (entries and/or `Service`s, below)
   returns per item `id`, `name` (`title` or the name), `expected_every_minutes`
-  (TICK reports `tick_minutes`, a service its declared value), `last_run_at`,
+  (TICK reports `tick_minutes`, a service its declared value; an entry may declare
+  one with `expected_every_minutes=`, and `None` means on demand), `last_run_at`,
   `last_ok_at`, `last_status` (`unknown` before any run), `last_error` (the latest
   failure's), `last_duration_ms`, `runs_24h`, `failures_24h`, plus `kind` / `where` when the entry declares them: the service
   shape of the `/heartbeats` contract (automations `docs/plans/HEARTBEATS.md`).
@@ -145,6 +148,12 @@ def heartbeats():
 `record_run` writes a `running` row on entry, then `ok`, or `failed` with the
 error cut to 300 characters (the exception still propagates); a cancellation is
 recorded `skipped`. There are no periods or backoff: the loop keeps its own timing.
+
+Work that runs only when something asks for it (a cache rebuilt on a request) is a
+service with no cadence: `Service("price-history", expected_every_minutes=None)`.
+`health()` reports `expected_every_minutes: null`, which the heartbeat contract
+reads as "on demand": never late, only a failed last run matters. Wrap only the
+real refresh in `record_run`, not the cache hits.
 One name runs one iteration at a time; a row still `running` when the next starts
 (the process stopped) is closed as `skipped`. Old records are pruned hourly, as
 with `run_due`.
@@ -163,11 +172,13 @@ from orbit_jobs.schedules import import_periods
 import_periods(preferences.get("scheduler_entry_periods") or {})   # once; existing state wins
 ```
 
-after which the preference is no longer read. Entries with `legacy_pref` should be
+after which the preference is no longer read. An app that also tracked failures
+keeps its pending retry and failure count with
+`import_periods(periods, failures={name: n}, retry_at={name: datetime})` (a naive
+time is UTC; leave a retrying entry's period out, as a failed run releases it). Entries with `legacy_pref` should be
 folded into that dict first (as its `load_state` does). Note the behaviour change:
-a raising timed action used to be retried every tick; it now backs off (give a
-daily entry such as the morning brief `backoff=Backoff(15, 60)` to retry hourly the
-same day). Apps with their own run tables (Reserve's `runs`, CardScanner's
+a raising timed action used to be retried every tick; it now backs off (1 h, then
+doubling; give the morning brief `backoff=Backoff(15, 60)` to retry sooner). Apps with their own run tables (Reserve's `runs`, CardScanner's
 `schedule:<name>` meta) can seed `schedule_state.period` the same way, or simply
 let each entry run once on the first tick.
 

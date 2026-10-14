@@ -187,17 +187,76 @@ def test_import_periods_keeps_an_already_run_period(clock):
     assert tick(entries, T0 + timedelta(days=1)) == {"daily": "ok"}
 
 
+def test_import_periods_seeds_failures_and_a_pending_retry(clock):
+    retry = T0 + timedelta(hours=2)
+    assert import_periods({}, failures={"news": 3}, retry_at={"news": retry}) == 1
+    assert state("news")["failures"] == 3
+    assert state("news")["retry_at"] == schedules._iso(retry)
+    action = Counter(fail=True)
+    entries = [Entry("news", Every(360), action)]
+    assert tick(entries, T0 + timedelta(minutes=119)) == {}       # the retry is kept
+    assert tick(entries, retry + timedelta(seconds=1)) == {"news": "failed"}
+    assert state("news")["failures"] == 4                           # grows from 3: 8 h
+    retry_at = schedules._parse(state("news")["retry_at"])
+    finished = schedules._parse(runs("news")[-1]["finished_at"])
+    assert retry_at - finished == timedelta(hours=8)
+
+
+def test_import_periods_retry_forms_and_existing_state_wins(clock):
+    naive = (T0 + timedelta(hours=1)).replace(tzinfo=None)
+    pacific = (T0 + timedelta(hours=1)).astimezone(timezone(timedelta(hours=-7)))
+    assert import_periods({"a": "2026-10-13"}, failures={"b": 1},
+                          retry_at={"c": naive.isoformat(), "d": pacific, "e": None}) == 4
+    assert state("c")["retry_at"] == state("d")["retry_at"] == schedules._iso(
+        T0 + timedelta(hours=1))
+    assert state("a")["failures"] == 0 and state("a")["retry_at"] is None
+    assert state("e") is None
+    assert import_periods({"a": "2026-10-12"}, failures={"a": 5, "b": 9},
+                          retry_at={"c": T0}) == 0
+    assert (state("a")["period"], state("a")["failures"]) == ("2026-10-13", 0)
+    assert state("b")["failures"] == 1
+    with pytest.raises(ValueError):
+        import_periods({}, retry_at={"f": "not a time"})
+
+
 # ── backoff ──────────────────────────────────────────────────────────
 
 
-def test_backoff_delay_grows_caps_and_respects_the_interval():
+def test_backoff_delay_grows_and_caps_regardless_of_the_interval():
     b = Backoff()
-    assert [b.delay_minutes(n, 5) for n in range(1, 8)] == [60, 120, 240, 480, 960, 1440, 1440]
-    assert b.delay_minutes(1, 6 * 60) == 360            # never sooner than the interval
-    assert b.delay_minutes(1, 30 * 1440) == 1440        # ...capped: a monthly retries daily
+    schedule = [60, 120, 240, 480, 960, 1440, 1440]
+    for interval in (5, 6 * 60, 1440, 30 * 1440, None):
+        assert [b.delay_minutes(n, interval) for n in range(1, 8)] == schedule
     assert b.delay_minutes(10_000, None) == 1440
-    assert Backoff(first_minutes=1, max_minutes=30).delay_minutes(1, 5) == 5
+    assert Backoff(first_minutes=1, max_minutes=30).delay_minutes(1, 5) == 1
     assert schedules.NO_BACKOFF.delay_minutes(3, 60) == 0
+
+
+def test_backoff_at_least_interval_keeps_the_old_floor():
+    b = Backoff(at_least_interval=True)
+    assert [b.delay_minutes(n, 6 * 60) for n in range(1, 6)] == [360, 360, 360, 480, 960]
+    assert b.delay_minutes(1, 30 * 1440) == 1440        # capped: a monthly retries daily
+    assert Backoff(1, 30, at_least_interval=True).delay_minutes(1, 5) == 5
+
+
+@pytest.mark.parametrize(("when", "first_retry"), [
+    (Every(360), timedelta(hours=1)),        # a 6-hourly entry retries after 1 h
+    (Daily(utc=True), timedelta(hours=1)),   # a daily one the same day
+    (Every(30 * 1440), timedelta(hours=1)),  # a monthly one well within a day
+])
+def test_a_failed_long_interval_entry_retries_on_the_backoff_schedule(clock, when, first_retry):
+    action = Counter(fail=True)
+    entries = [Entry("slow", when, action)]
+    assert tick(entries, T0) == {"slow": "failed"}
+    assert tick(entries, T0 + first_retry - timedelta(minutes=1)) == {}
+    assert tick(entries, T0 + first_retry + timedelta(minutes=1)) == {"slow": "failed"}
+    retry_at = schedules._parse(state("slow")["retry_at"])
+    finished = schedules._parse(runs("slow")[-1]["finished_at"])
+    assert retry_at - finished == timedelta(hours=2)
+    action.fail = False
+    assert tick(entries, retry_at + timedelta(seconds=1)) == {"slow": "ok"}
+    assert tick(entries, retry_at + timedelta(minutes=5)) == {}  # back to its cadence
+    assert action.calls == 3
 
 
 def test_failures_back_off_then_a_success_resets(clock):
@@ -404,6 +463,23 @@ def test_health_shape_and_24h_counts(clock):
     }
     assert sweep["expected_every_minutes"] == 1 and sweep["runs_24h"] == 4
     assert health(entries[2:], now, tick_minutes=0.5)[0]["expected_every_minutes"] == 0.5
+
+
+def test_on_demand_and_overridden_cadence_in_health(clock):
+    items = [
+        Entry("queue", TICK, Counter(), expected_every_minutes=None),
+        Entry("hourly-ish", Every(5), Counter(), expected_every_minutes=60),
+        Entry("default", Every(5), Counter()),
+        Service("art-index", expected_every_minutes=None, kind="refresh"),
+    ]
+    with record_run(items[3]):
+        pass
+    queue, hourly, default, art = health(items, T0)
+    assert queue["expected_every_minutes"] is None
+    assert hourly["expected_every_minutes"] == 60
+    assert default["expected_every_minutes"] == 5
+    assert art["expected_every_minutes"] is None and art["last_status"] == "ok"
+    assert art["kind"] == "refresh"
 
 
 # ── hand-written loops (Service + record_run) ─────────────────────────
