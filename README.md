@@ -15,7 +15,7 @@ package. It imports nothing from either. Both depend on it by git tag:
 dependencies = ["orbit-jobs[remote,server,mesh]"]
 
 [tool.uv.sources]
-orbit-jobs = { git = "https://github.com/vixtah/orbit-jobs", tag = "v0.2.2" }
+orbit-jobs = { git = "https://github.com/vixtah/orbit-jobs", tag = "v0.2.3" }
 ```
 
 ## Public API
@@ -148,6 +148,9 @@ def heartbeats():
 `record_run` writes a `running` row on entry, then `ok`, or `failed` with the
 error cut to 300 characters (the exception still propagates); a cancellation is
 recorded `skipped`. There are no periods or backoff: the loop keeps its own timing.
+Recording never breaks the work: if the job database can't be written when a run
+opens or closes, a warning is logged, the block still runs, and its own result or
+exception reaches the caller unchanged.
 
 Work that runs only when something asks for it (a cache rebuilt on a request) is a
 service with no cadence: `Service("price-history", expected_every_minutes=None)`.

@@ -5,6 +5,7 @@ entries, isolation, health and pruning. Fake clock throughout: every tick passes
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -526,6 +527,48 @@ def test_record_run_closes_a_run_cut_off_by_a_stopped_process(clock):
         pass
     assert [(r["status"], r["error"]) for r in runs("sweeper")] == [
         ("skipped", "interrupted (the process stopped mid-run)"), ("ok", None)]
+
+
+def _broken_db(monkeypatch, *, on_open: bool, on_close: bool):
+    real_open, real_close = schedules._open_run, schedules._close_run
+
+    def fail(*_a, **_k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(schedules, "_open_run", fail if on_open else real_open)
+    monkeypatch.setattr(schedules, "_close_run", fail if on_close else real_close)
+
+
+@pytest.mark.parametrize("on_open,on_close", [(True, False), (False, True), (True, True)])
+def test_record_run_database_failure_never_breaks_the_work(clock, monkeypatch, caplog,
+                                                             on_open, on_close):
+    _broken_db(monkeypatch, on_open=on_open, on_close=on_close)
+    done = []
+    with caplog.at_level("WARNING", logger="orbit_jobs.schedules"):
+        with record_run("sweeper"):
+            done.append("sync")
+        with pytest.raises(ValueError, match="bad shard") as raised:
+            with record_run("sweeper"):
+                raise ValueError("bad shard")
+        assert type(raised.value) is ValueError
+
+        async def main():
+            async with record_run("sweeper"):
+                done.append("async")
+            with pytest.raises(KeyError):
+                async with record_run("sweeper"):
+                    raise KeyError("k")
+            with pytest.raises(asyncio.CancelledError):
+                async with record_run("sweeper"):
+                    raise asyncio.CancelledError()
+
+        asyncio.run(main())
+    assert done == ["sync", "async"]
+    warned = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warned) == 5
+    assert all("sweeper" in r.getMessage() for r in warned)
+    if on_open:
+        assert runs("sweeper") == []
 
 
 def test_health_mixes_entries_and_services(clock):

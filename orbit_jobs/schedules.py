@@ -510,7 +510,9 @@ class record_run:  # lower-case: used like a function, ``with record_run(name):`
     :func:`health` like an entry: ``running`` on entry, then ``ok``, or ``failed``
     with the error (cut to 300 characters) when the block raises; the exception still
     propagates. A cancellation (``CancelledError``, ``KeyboardInterrupt``) is recorded
-    ``skipped``. Works as ``with`` and ``async with`` (the async form does its
+    ``skipped``. Recording never breaks the work: if a database write fails (opening
+    or closing the run) a warning is logged, the block still runs and its own result
+    or exception reaches the caller unchanged. Works as ``with`` and ``async with`` (the async form does its
     database writes off the event loop). ``service`` is a :class:`Service` or its
     name. One name runs one iteration at a time: a row still ``running`` when the
     next starts is closed as ``skipped`` (interrupted). Old records are pruned at most
@@ -521,21 +523,35 @@ class record_run:  # lower-case: used like a function, ``with record_run(name):`
         self._run_id: int | None = None
         self._started = 0.0
 
+    # Telemetry never breaks the work: a failed write (database locked, missing,
+    # read-only) is logged as a warning, the block still runs, and its own outcome
+    # (return or exception) is what the caller sees.
+
     def __enter__(self) -> record_run:
-        self._run_id = _open_run(self.name)
+        try:
+            self._run_id = _open_run(self.name)
+        except Exception:
+            self._run_id = None
+            logger.warning("recording the start of %s failed; running it unrecorded",
+                           self.name, exc_info=True)
         self._started = time.monotonic()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         if self._run_id is None:
             return
-        try:  # a recording failure never masks the block's own outcome
+        try:
             _close_run(self._run_id, self._started, exc)
         except Exception:
-            logger.exception("recording the end of %s failed", self.name)
+            logger.warning("recording the end of %s failed", self.name, exc_info=True)
 
     async def __aenter__(self) -> record_run:
-        self._run_id = await asyncio.to_thread(_open_run, self.name)
+        try:
+            self._run_id = await asyncio.to_thread(_open_run, self.name)
+        except Exception:
+            self._run_id = None
+            logger.warning("recording the start of %s failed; running it unrecorded",
+                           self.name, exc_info=True)
         self._started = time.monotonic()
         return self
 
@@ -545,7 +561,7 @@ class record_run:  # lower-case: used like a function, ``with record_run(name):`
         try:
             await asyncio.to_thread(_close_run, self._run_id, self._started, exc)
         except Exception:
-            logger.exception("recording the end of %s failed", self.name)
+            logger.warning("recording the end of %s failed", self.name, exc_info=True)
 
 
 # ── maintenance + read side ──────────────────────────────────────────
